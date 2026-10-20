@@ -81,12 +81,15 @@ instead of adding a backend.
 - [x] **0. Hosting** — Pages + Actions deploy, live at
       <https://able-bodied-man.github.io/kmb_her_her/>
 - [x] **1. Data** — GTFS → compact routing dataset, verified
-- [ ] **2. Routing engine** — RAPTOR over trips + walking transfers, unit-tested
-      against hand-checked journeys (e.g. Chuk Yuen → Causeway Bay)
-- [ ] **3. Map UI** — origin/destination picking (search stops, click map,
-      geolocate), itinerary with leg-by-leg times, route numbers, walking legs
-- [ ] **4. Polish** — Chinese (zh-HK) names via KMB ETA coordinate match, live
-      arrivals, "leave at / arrive by", service-day handling incl. public holidays
+- [x] **2. Routing engine** — label-setting search over patterns + walking
+      transfers (`js/app.js`). 20–80 ms per query in the browser; checked against
+      hand-verifiable journeys (竹園邨→銅鑼灣, 元朗→尖沙咀, 天水圍→機場) and a
+      negative case (赤柱 returns no plan rather than a fake one)
+- [x] **3. Map UI** — Chinese-first UI, stop search (zh + en), map-pick, waiting
+      times, itinerary legs, OSM raster tiles, optional second option
+- [x] **4a. Chinese** — stop names and headsigns from the operator API; service
+      days use `calendar_dates.txt` (public-holiday overrides honoured)
+- [ ] **4b. Polish** — live arrivals, "arrive by" search, joint-route flagging
 - [ ] **5. Calibration** — per-segment run times from observed ETA data
 
 ## Known limits

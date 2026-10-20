@@ -361,6 +361,7 @@ def main() -> int:
     t_offset, t_nstops, t_headsign = array("I"), array("H"), array("H")
 
     st_stop, st_arr = array("H"), array("H")
+    trip_stop_lists: list[tuple[int, ...]] = []
 
     n_stopts = 0
     for trip in trips:
@@ -376,14 +377,17 @@ def main() -> int:
         t_nstops.append(len(arr))
         t_headsign.append(trip_headsign.get(trip["trip_id"], 0xFFFF))
         prev = 0
+        idx_list: list[int] = []
         for seq, sec, sid, pickup, dropoff in arr:
             idx = stop_index[sid]
+            idx_list.append(idx)
             delta = idx - prev + 3605                      # 0..7210 -> 13 bits
             flags = (1 if pickup == 0 else 0) | (2 if dropoff == 0 else 0)
             st_stop.append((delta & 0x1FFF) | (flags << 13))
             st_arr.append(max(0, min(65535, sec - start)))
             prev = idx
             n_stopts += 1
+        trip_stop_lists.append(tuple(idx_list))
 
     with open(os.path.join(OUT, "trips.bin"), "wb") as f:
         f.write(struct.pack("<4sII", b"KHH2", len(t_route), n_stopts))
@@ -392,6 +396,59 @@ def main() -> int:
     with open(os.path.join(OUT, "stoptimes.bin"), "wb") as f:
         f.write(struct.pack("<4sI", b"KHT2", n_stopts))
         st_stop.tofile(f); st_arr.tofile(f)
+
+    # ---------------------------------------------------------------- patterns
+    # Every distinct (route, ordered stop sequence) is a pattern; its trips are
+    # stored sorted by departure so a routing round can binary-search the first
+    # trip that can still be caught.
+    log("      grouping trips into patterns")
+    pattern_key: dict[tuple[int, tuple[int, ...]], int] = {}
+    p_route = array("H")
+    p_stops: list[tuple[int, ...]] = []
+    p_trips: list[list[int]] = []
+    for trip_idx, stops_tuple in enumerate(trip_stop_lists):
+        key = (t_route[trip_idx], stops_tuple)
+        pi = pattern_key.get(key)
+        if pi is None:
+            pi = len(p_stops)
+            pattern_key[key] = pi
+            p_route.append(t_route[trip_idx])
+            p_stops.append(stops_tuple)
+            p_trips.append([])
+        p_trips[pi].append(trip_idx)
+    for lst in p_trips:
+        lst.sort(key=lambda ti: t_start[ti])
+
+    p_stop_off = array("I", [0])
+    p_trip_off = array("I", [0])
+    pat_stops = array("H")
+    pat_trips = array("I")
+    sp_off = array("I", [0])
+    sp_pair = array("I")
+    inc_by_stop: list[list[tuple[int, int]]] = [[] for _ in range(len(stop_list))]
+    for pi, stops_tuple in enumerate(p_stops):
+        for pos, sidx in enumerate(stops_tuple):
+            pat_stops.append(sidx)
+            inc_by_stop[sidx].append((pi, pos))
+        p_stop_off.append(len(pat_stops))
+        for ti in p_trips[pi]:
+            pat_trips.append(ti)
+        p_trip_off.append(len(pat_trips))
+
+    for sidx in range(len(stop_list)):
+        for pi, pos in inc_by_stop[sidx]:
+            sp_pair.append((pi << 8) | pos)
+        sp_off.append(len(sp_pair))
+
+    with open(os.path.join(OUT, "patterns.bin"), "wb") as f:
+        f.write(struct.pack("<4sIII", b"KHP1", len(p_stops), len(pat_stops), len(pat_trips)))
+        p_route.tofile(f); p_stop_off.tofile(f); p_trip_off.tofile(f)
+        pat_stops.tofile(f); pat_trips.tofile(f)
+    with open(os.path.join(OUT, "stoppatterns.bin"), "wb") as f:
+        f.write(struct.pack("<4sII", b"KPS1", len(stop_list), len(sp_pair)))
+        sp_off.tofile(f); sp_pair.tofile(f)
+    log(f"      {len(p_stops)} patterns, {len(pat_stops)} pattern-stop entries, "
+        f"{len(sp_pair)} stop->pattern incidences")
 
     # walking transfers: every pair of distinct stops within WALK_RADIUS_M
     lats = [s[1] for s in stop_list]

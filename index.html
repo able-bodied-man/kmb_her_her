@@ -1,11 +1,68 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="zh-Hant-HK">
 <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>kmb_her_her</title>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#b4232b">
+<title>kmb_her_her · 九巴龍運路線規劃</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
+<link rel="stylesheet" href="css/style.css">
 </head>
 <body>
-    <h1>kmb_her_her</h1>
+<header>
+  <h1>kmb_her_her</h1>
+  <p class="sub">九巴／龍運月票持有者路線規劃 · 只計九巴、龍運及聯營線 + 步行</p>
+</header>
+
+<main>
+  <section class="panel" id="panel">
+    <div class="field">
+      <label for="from-input">起點</label>
+      <div class="input-row">
+        <input id="from-input" type="search" placeholder="搜尋巴士站（中文或英文）" autocomplete="off" spellcheck="false">
+        <button class="ghost" id="from-map" type="button" title="在地圖上選擇">地圖</button>
+      </div>
+      <ul class="suggest" id="from-suggest" hidden></ul>
+      <p class="picked" id="from-picked" hidden></p>
+    </div>
+
+    <div class="field">
+      <label for="to-input">終點</label>
+      <div class="input-row">
+        <input id="to-input" type="search" placeholder="搜尋巴士站（中文或英文）" autocomplete="off" spellcheck="false">
+        <button class="ghost" id="to-map" type="button" title="在地圖上選擇">地圖</button>
+      </div>
+      <ul class="suggest" id="to-suggest" hidden></ul>
+      <p class="picked" id="to-picked" hidden></p>
+    </div>
+
+    <div class="field row">
+      <label for="time-input">出發時間</label>
+      <input id="time-input" type="time" step="60">
+      <button class="ghost" id="now-btn" type="button">現在</button>
+    </div>
+
+    <button id="go" type="button" disabled>規劃路線</button>
+    <p class="hint" id="status">載入資料中…</p>
+    <p class="hint tiny">
+      中途站時間由班次總行車時間推算，誤差約 ±1–2 分鐘；開出時間與全程行車時間為確實數據。
+      步行時間以直線距離估算，過海路段（如鯉魚門）未排除。
+    </p>
+  </section>
+
+  <section id="results" aria-live="polite"></section>
+  <section id="map"></section>
+</main>
+
+<footer>
+  資料：運輸署 GTFS · 九巴／龍運開放數據 ·
+  <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">© OpenStreetMap contributors</a>
+  · <a href="https://github.com/able-bodied-man/kmb_her_her" target="_blank" rel="noopener">原始碼</a>
+</footer>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+<script src="js/app.js"></script>
 </body>
 </html>
