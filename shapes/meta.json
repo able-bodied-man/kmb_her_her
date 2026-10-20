@@ -1,0 +1,11 @@
+{
+  "source": "OpenStreetMap (Geofabrik HK extract) road network, A* per stop pair",
+  "simplify_m": 7.0,
+  "snap_m": 90.0,
+  "patterns": 1503,
+  "points": 254986,
+  "bytes": 2121682,
+  "pairs_routed": 7493,
+  "pairs_unroutable": 8,
+  "stops_snapped": 3604
+}

@@ -58,6 +58,7 @@ ALLOWED_AGENCIES = {"KMB", "LWB", "KMB+CTB", "LWB+CTB"}
 WALK_RADIUS_M = 400.0          # stop <-> stop walking transfer
 DWELL_SECS = 20                # assumed dwell at each intermediate stop
 DEFAULT_KMH = 19.0             # fallback speed when a trip has a single timestamp
+MAX_BUS_KMH = 45.0             # anything faster than this is a bad published duration
 EARTH_R = 6371000.0
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -114,64 +115,87 @@ def haversine(lat1, lon1, lat2, lon2) -> float:
     return 2 * EARTH_R * math.asin(min(1.0, a ** 0.5))
 
 
-def interpolate(secs: list[int | None], lats: list[float], lons: list[float]) -> int:
-    """Fill the blank times of one trip in place; return how many were filled.
+def segment_kmh(dist_m: float) -> float:
+    """Plausible average speed for a bus over one inter-stop hop.
 
-    Known times (first/last stop, occasional timepoints) are kept verbatim.
-    Each run of blanks between two anchors is spread over the measured gap in
-    proportion to cumulative inter-stop distance, minus a dwell allowance.
+    Short hops are dense urban stops (slow), long hops are expressway runs
+    (fast). This is what keeps a 9 km Kowloon slice from being scheduled in
+    12 minutes just because the published trip duration is optimistic.
+    """
+    if dist_m < 250:
+        return 18.0
+    if dist_m < 600:
+        return 24.0
+    if dist_m < 1200:
+        return 32.0
+    if dist_m < 2500:
+        return 42.0
+    return 52.0
+
+
+def interpolate(secs: list[int | None], lats: list[float], lons: list[float]) -> tuple[int, bool]:
+    """Fill the blank times of one trip in place.
+
+    Returns (how many times were filled, whether the trip had to be stretched
+    because the published duration is faster than any bus can drive).
+
+    Known times (first stop, last stop, occasional timepoints) are kept verbatim
+    when the published gap is long enough. The gap is shared out in proportion to
+    a speed-profile model of each hop (short hop = slow, long hop = fast, plus a
+    dwell allowance), so intermediate times reflect how the trip actually runs
+    instead of a uniform average.
     """
     n = len(secs)
     if n == 0:
-        return 0
+        return 0, False
     anchors = [i for i, s in enumerate(secs) if s is not None]
 
-    # distance along the trip, in metres
     cum = [0.0]
     for i in range(1, n):
         cum.append(cum[-1] + haversine(lats[i - 1], lons[i - 1], lats[i], lons[i]))
 
+    # model seconds for each hop, and cumulative model time from the trip start
+    model = [0.0]
+    for i in range(1, n):
+        d = cum[i] - cum[i - 1]
+        model.append(model[-1] + d / (segment_kmh(d) / 3.6) + DWELL_SECS)
+
     filled = 0
-    if not anchors:                                  # nothing at all: give up on this trip
-        return 0
-    if len(anchors) == 1:                            # only one timestamp: fall back to a speed
+    stretched = False
+    if not anchors:
+        return 0, False
+    if len(anchors) == 1:
         a = anchors[0]
-        secs[a] = secs[a]
         for i in range(n):
             if i == a:
                 continue
-            dist_km = abs(cum[i] - cum[a]) / 1000.0
-            est = DEFAULT_KMH * 1000 / 3600
-            delta = dist_km * 1000 / est + DWELL_SECS * abs(i - a)
-            secs[i] = int(round(secs[a] + (delta if i > a else -delta)))
+            secs[i] = int(round(secs[a] + (model[i] - model[a])))
             filled += 1
     else:
-        # leading blanks before the first anchor
         first = anchors[0]
-        for i in range(first):
-            dist_km = (cum[first] - cum[i]) / 1000.0
-            secs[i] = int(round(secs[first] - dist_km * 1000 / (DEFAULT_KMH * 1000 / 3600)
-                                - DWELL_SECS * (first - i)))
+        for i in range(first):                        # before the first timestamp
+            secs[i] = int(round(secs[first] - (model[first] - model[i])))
             filled += 1
-        # gaps between anchors
         for lo, hi in zip(anchors, anchors[1:]):
             if hi - lo == 1:
                 continue
             gap = secs[hi] - secs[lo]
+            model_gap = model[hi] - model[lo]
             inner = list(range(lo + 1, hi))
-            span = cum[hi] - cum[lo]
-            dwell_budget = DWELL_SECS * len(inner)
-            run_budget = max(gap - dwell_budget, 0.25 * gap if gap > 0 else 1.0)
-            for k, i in enumerate(inner):
-                frac = ((cum[i] - cum[lo]) / span) if span > 0 else (k + 1) / (len(inner) + 1)
-                secs[i] = int(round(secs[lo] + dwell_budget * (k + 1) / len(inner) + run_budget * frac))
+            if model_gap <= 0 or len(inner) == 0:
+                continue
+            fit = gap / model_gap
+            for i in inner:
+                secs[i] = int(round(secs[lo] + (model[i] - model[lo]) * fit))
                 filled += 1
-        # trailing blanks after the last anchor
+            if fit < 0.92:                            # published gap faster than any bus: keep the model
+                stretched = True
+                for i in inner:
+                    secs[i] = int(round(secs[lo] + (model[i] - model[lo])))
+                secs[hi] = max(secs[hi], int(round(secs[lo] + model_gap)))
         last = anchors[-1]
-        for i in range(last + 1, n):
-            dist_km = (cum[i] - cum[last]) / 1000.0
-            secs[i] = int(round(secs[last] + dist_km * 1000 / (DEFAULT_KMH * 1000 / 3600)
-                                + DWELL_SECS * (i - last)))
+        for i in range(last + 1, n):                  # after the last timestamp
+            secs[i] = int(round(secs[last] + (model[i] - model[last])))
             filled += 1
     # enforce monotonic, non-negative times
     prev = -1
@@ -183,7 +207,7 @@ def interpolate(secs: list[int | None], lats: list[float], lons: list[float]) ->
             v = 0
         secs[i] = v
         prev = v
-    return filled
+    return filled, stretched
 
 
 def main() -> int:
@@ -225,6 +249,8 @@ def main() -> int:
 
     stop_times: dict[str, list[tuple[int, int, str, int, int]]] = {}
     blanks = 0
+    scaled = 0
+    worst = []
     for tid, arr in raw.items():
         arr.sort(key=lambda x: x[0])
         if not arr:
@@ -232,12 +258,38 @@ def main() -> int:
         lats = [coords[r[2]][0] for r in arr]
         lons = [coords[r[2]][1] for r in arr]
         secs: list[int | None] = [gtfs_secs(r[1]) if r[1] else None for r in arr]
-        blanks += interpolate(secs, lats, lons)
+        filled, was_stretched = interpolate(secs, lats, lons)
+        blanks += filled
+        # Second plausibility pass: a route with urban stop spacing cannot average
+        # expressway speed, however fast the operator's published trip duration
+        # looks (HK1's sightseeing loop claims ~47 km/h down Nathan Road).
+        hops = sorted(haversine(lats[i - 1], lons[i - 1], lats[i], lons[i])
+                      for i in range(1, len(arr)))
+        total_d = sum(hops)
+        dur = (secs[-1] or 0) - (secs[0] or 0)
+        if hops and total_d > 1500 and dur > 0:
+            median_hop = hops[len(hops) // 2]
+            # straight-line sums understate road distance; 1.5x is a conservative
+            # detour factor for a bus route (measured road/straight ratio on our
+            # own shapes is ~1.4-1.6)
+            implied = (total_d * 1.5 / 1000) / (dur / 3600)
+            if implied > 42.0 and median_hop < 1800:
+                factor = implied / 38.0
+                base = secs[0] or 0
+                for i in range(len(secs)):
+                    secs[i] = int(round(base + ((secs[i] or 0) - base) * factor))
+                was_stretched = True
+        if was_stretched:
+            scaled += 1
+            if len(worst) < 5:
+                worst.append((tid, round(total_d / 1000, 1), (secs[-1] or 0) // 60))
         stop_times[tid] = [(r[0], secs[i], r[2], r[3], r[4]) for i, r in enumerate(arr)]  # type: ignore[list-item]
 
     used_stop_ids = {st[2] for arr in stop_times.values() for st in arr}
     n_rows = sum(len(v) for v in stop_times.values())
     log(f"      {n_rows} rows, reconstructed {blanks} intermediate times over {len(used_stop_ids)} stops")
+    if scaled:
+        log(f"      stretched {scaled} trips with implausible published durations, e.g. {worst}")
 
     log("[5/8] stop index")
     stop_list, stop_index = [], {}
@@ -502,7 +554,8 @@ def main() -> int:
                    "headsigns": len(headsigns),
                    "stops_with_chinese_name": sum(1 for s in stop_list if len(s) > 4 and s[4]),
                    "trips_with_headsign": sum(1 for h in t_headsign if h != 0xFFFF),
-                   "headsign_reaches_terminus": headsign_end_ok},
+                   "headsign_reaches_terminus": headsign_end_ok,
+                   "trips_duration_stretched": scaled},
         "names_source": "data.etabus.gov.hk (KMB/LWB open data API), matched by coordinate",
         "walk_radius_m": WALK_RADIUS_M,
         "bounds": [min(lats), min(lons), max(lats), max(lons)],

@@ -53,6 +53,8 @@ async function boot() {
     getBuffer('trips.bin'), getBuffer('stoptimes.bin'), getBuffer('walk.bin'),
     getBuffer('patterns.bin'), getBuffer('stoppatterns.bin'),
   ]);
+  // route alignments are optional: without them the map falls back to straight lines
+  state.shapes = await loadShapes();
 
   // trips.bin: <4s II> then u16 route, u8 service, u32 start, u32 offset, u16 nstops, u16 headsign
   const nTrips = new DataView(tripsBuf).getUint32(4, true);
@@ -91,6 +93,10 @@ async function boot() {
   const patTrips = u32(patBuf, po, nTripRefs);
   state.pat = { n: nPat, route: pRoute, stopOff: pStopOff, tripOff: pTripOff,
                 stops: patStops, trips: patTrips };
+  if (state.shapes && state.shapes.nPat !== state.pat.n) {
+    console.warn(`route shapes cover ${state.shapes.nPat} patterns, data has ${state.pat.n}; ignoring them`);
+    state.shapes = null;                     // geometry built against a different dataset
+  }
 
   // stoppatterns.bin: <4s II> then u32 offsets[nStops+1], u32 (pattern<<8 | pos)
   const dvsp = new DataView(spBuf);
@@ -208,6 +214,43 @@ function activeServices(date) {
     if (type === 1) set.add(i); else set.delete(i);
   }
   return set;
+}
+
+/* -------------------------------------------------------------- route shapes
+ * shapes/shapes.bin holds, per pattern, the polyline along OSM roads plus the
+ * vertex index of every stop, so an alighting-to-boarding slice is a slice.
+ */
+async function loadShapes() {
+  try {
+    const b = await (await fetch('shapes/shapes.bin', { cache: 'no-cache' })).arrayBuffer();
+    const dv = new DataView(b);
+    const magic = String.fromCharCode(...new Uint8Array(b, 0, 4));
+    if (magic !== 'KHS1') throw new Error(`bad magic ${magic}`);
+    const nPat = dv.getUint32(4, true), nPts = dv.getUint32(8, true), nStopIdx = dv.getUint32(12, true);
+    let o = 16;
+    const pointOff = u32(b, o, nPat + 1); o += (nPat + 1) * 4;
+    const stopOff = u32(b, o, nPat + 1); o += (nPat + 1) * 4;
+    const pts = new Int32Array(b.slice(o, o + nPts * 8)); o += nPts * 8;
+    const stopVertex = u16(b, o, nStopIdx);
+    return { nPat, pointOff, stopOff, pts, stopVertex };
+  } catch (e) {
+    console.warn('route shapes unavailable, drawing straight lines', e);
+    return null;
+  }
+}
+
+function legGeometry(pi, board, alight) {
+  const s = state.shapes;
+  if (!s || pi === undefined || pi === null || pi < 0 || pi >= s.nPat) return null;
+  const a = s.stopVertex[s.stopOff[pi] + board];
+  const b = s.stopVertex[s.stopOff[pi] + alight];
+  if (a === undefined || b === undefined || b <= a) return null;
+  const base = s.pointOff[pi];
+  const out = [];
+  for (let i = a; i <= b; i++) {
+    out.push([s.pts[(base + i) * 2] / 1e5, s.pts[(base + i) * 2 + 1] / 1e5]);
+  }
+  return out.length > 1 ? out : null;
 }
 
 /* ------------------------------------------------------------------ geometry */
@@ -509,13 +552,16 @@ function drawPlan(plan) {
   for (const leg of plan.legs) {
     if (leg.type === 'bus') {
       const { pattern: pi, board, alight } = leg;
-      const base = state.pat.stopOff[pi];
-      const line = [];
-      for (let p = board; p <= alight; p++) {
-        const s = state.stops[state.pat.stops[base + p]];
-        line.push([s[1], s[2]]);
+      let line = legGeometry(pi, board, alight);
+      if (!line) {                          // no alignment for this pattern: straight hops
+        const base = state.pat.stopOff[pi];
+        line = [];
+        for (let p = board; p <= alight; p++) {
+          const s = state.stops[state.pat.stops[base + p]];
+          line.push([s[1], s[2]]);
+        }
       }
-      addLayer(L.polyline(line, { color: '#b4232b', weight: 5, opacity: .85 }));
+      addLayer(L.polyline(line, { color: '#b4232b', weight: 5, opacity: .85, smoothFactor: 1 }));
       const b = line[0], a = line[line.length - 1];
       addLayer(L.circleMarker(b, { radius: 4, color: '#b4232b', fillColor: '#fff', fillOpacity: 1, weight: 2 }));
       addLayer(L.circleMarker(a, { radius: 4, color: '#b4232b', fillColor: '#fff', fillOpacity: 1, weight: 2 }));

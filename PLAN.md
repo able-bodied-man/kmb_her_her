@@ -41,12 +41,41 @@ single TD stop can sit next to several operator kerbs at an interchange — so t
 matcher keeps *all* kerbs within 40 m and aligns trips against them, rather than
 taking the nearest one.
 
+### Route geometry (real alignments)
+
+The TD feed has no `shapes.txt` (the URL is 403), so alignments are reconstructed
+in `pipeline/build_shapes.py` from the OpenStreetMap Hong Kong road extract:
+
+- 69,683 drivable OSM ways → 376,617 nodes / 609,205 directed edges
+- every consecutive stop pair is connected by A* over that graph (one-way
+  restrictions respected, undirected retry when a loop makes a pair unroutable)
+- snapped to the largest connected component, 3,604 / 3,605 stops matched
+- Douglas-Peucker at 7 m, then stored per pattern with the vertex index of each
+  stop, so drawing a leg is a slice of the pattern polyline
+
+| metric | value |
+|---|---|
+| patterns with geometry | 1,503 |
+| vertices | 254,986 (median spacing 95 m) |
+| road length ÷ straight-line length | median **1.86** (a straight line would be 1.00) |
+| unroutable stop pairs | 8 of 7,493 |
+| payload | 2.12 MB raw → ~750 KB gzipped |
+
+`shapes/shapes.bin` is committed (geometry changes when roads change, not when the
+timetable refreshes); CI serves it as-is and the client refuses it if its pattern
+count does not match the freshly built timetable, falling back to straight lines.
+
+
 **The catch:** TD timestamps only the *first and last* stop of each trip — 91 %
 of intermediate times are blank. Trip departure times and total run times are
-exact; intermediate times are reconstructed as
-`duration spread over inter-stop distance + 20 s dwell per stop`, so they carry
-roughly ±1–2 min of error. Verified against route 1 (Chuk Yuen → Star Ferry,
-46 min, 25 stops) and 968 (Yuen Long → Causeway Bay, 78 min).
+exact; intermediate times are reconstructed with a per-hop speed profile (short
+hop = slow urban stop, long hop = expressway run, 20 s dwell each) fitted to the
+published duration, so they carry roughly ±1–2 min of error. Trips whose published
+duration implies a bus averaging faster than 42 km/h with urban stop spacing are
+stretched (3,096 of 22,931) — an operator timetable that has a 9 km Kowloon run
+in 12 minutes is wrong, and the map would otherwise show a bus outrunning traffic.
+Verified against route 1 (Chuk Yuen → Star Ferry, 46 min, 25 stops) and 968
+(Yuen Long → Causeway Bay, 78 min).
 
 That reconstruction is the main accuracy lever. Upgrade path: poll the KMB/LWB
 real-time ETA API for the same routes and calibrate per-segment run times from
