@@ -15,7 +15,11 @@ html, body {
   padding: 0;
   background: var(--bg);
   color: var(--ink);
-  font-family: "Noto Sans TC", "PingFang HK", "Microsoft JhengHei", "Helvetica Neue", Arial, sans-serif;
+  /* CJK-capable families first: if a Latin-only face wins the cascade, some
+     renderers draw Chinese as .notdef boxes instead of falling back per glyph */
+  font-family: "Noto Sans TC", "Noto Sans CJK TC", "PingFang HK", "Microsoft JhengHei",
+               "Droid Sans Fallback", "Hiragino Sans GB", system-ui, -apple-system,
+               "Segoe UI", Roboto, Arial, sans-serif;
   font-size: 16px;
   line-height: 1.5;
 }
