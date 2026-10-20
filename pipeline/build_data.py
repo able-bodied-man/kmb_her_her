@@ -293,8 +293,9 @@ def main() -> int:
     ambiguous = 0
     route_short = {r["route_id"]: r["route_short_name"] for r in routes}
 
-    def order_score(trip_stop_ids: list[str], variant_stops: list[str]) -> int:
-        """How many of the trip's stops the variant contains, in order.
+    def order_score(trip_stop_ids: list[str], variant_stops: list[str]) -> tuple[int, int]:
+        """How many of the trip's stops the variant contains, in order, and the
+        variant index the trip reached.
 
         Each TD stop may sit near several operator kerbs, so the trip stop is
         aligned to whichever nearby kerb the variant actually serves.
@@ -313,7 +314,9 @@ def main() -> int:
             if best >= 0:
                 hit += 1
                 last = best
-        return hit
+        return hit, last
+
+    end_ok = 0
 
     for trip in trips:
         arr = stop_times.get(trip["trip_id"])
@@ -324,16 +327,19 @@ def main() -> int:
         if not cands:
             continue
         trip_stops = [sid for _seq, _sec, sid, _pu, _do in arr]
-        best, best_score = None, 0
+        best, best_score, best_last = None, 0, -1
         for v in cands:
-            sc = order_score(trip_stops, seqs[(route_short[trip["route_id"]],
-                                               v["bound"], v["service_type"])])
+            vstops = seqs[(route_short[trip["route_id"]], v["bound"], v["service_type"])]
+            sc, last = order_score(trip_stops, vstops)
             if sc > best_score:
-                best, best_score = v, sc
+                best, best_score, best_last = v, sc, last
             elif sc == best_score and sc > 0:
                 ambiguous += 1
         if best is None or best_score < max(2, len(trip_stops) // 2):
             continue
+        vlen = len(seqs[(route_short[trip["route_id"]], best["bound"], best["service_type"])])
+        if best_last >= vlen - 2:                 # trip really runs to that terminus
+            end_ok += 1
         key = (route_short[trip["route_id"]], best["bound"], best["orig_tc"], best["dest_tc"])
         idx = headsign_index.get(key)
         if idx is None:
@@ -342,7 +348,9 @@ def main() -> int:
             headsigns.append([key[0], key[1], key[2], key[3]])
         trip_headsign[trip["trip_id"]] = idx
     log(f"      {len(trip_headsign)} / {len(trips)} trips carry a Chinese headsign "
-        f"({len(headsigns)} distinct, {ambiguous} ambiguous matches)")
+        f"({len(headsigns)} distinct, {end_ok} reach the terminus that names them, "
+        f"{ambiguous} ambiguous matches)")
+    headsign_end_ok = end_ok
 
     log("[8/8] packing")
     route_order = sorted(routes, key=lambda r: (r["agency_id"], r["route_short_name"], r["route_id"]))
@@ -436,7 +444,8 @@ def main() -> int:
                    "stops": len(stop_list), "walk_links": n_walk, "times_reconstructed": blanks,
                    "headsigns": len(headsigns),
                    "stops_with_chinese_name": sum(1 for s in stop_list if len(s) > 4 and s[4]),
-                   "trips_with_headsign": sum(1 for h in t_headsign if h != 0xFFFF)},
+                   "trips_with_headsign": sum(1 for h in t_headsign if h != 0xFFFF),
+                   "headsign_reaches_terminus": headsign_end_ok},
         "names_source": "data.etabus.gov.hk (KMB/LWB open data API), matched by coordinate",
         "walk_radius_m": WALK_RADIUS_M,
         "bounds": [min(lats), min(lons), max(lats), max(lons)],
