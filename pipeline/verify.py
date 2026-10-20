@@ -18,21 +18,24 @@ D = os.path.join(ROOT, "data")
 def load():
     stops = json.load(open(os.path.join(D, "stops.json"), encoding="utf-8"))
     routes = json.load(open(os.path.join(D, "routes.json"), encoding="utf-8"))
+    headsigns = json.load(open(os.path.join(D, "headsigns.json"), encoding="utf-8"))
     meta = json.load(open(os.path.join(D, "meta.json"), encoding="utf-8"))
     with open(os.path.join(D, "trips.bin"), "rb") as f:
         magic, n_trips, n_st = struct.unpack("<4sII", f.read(12))
-        assert magic == b"KHH1", magic
+        assert magic == b"KHH2", magic
         t_route = array("H"); t_route.fromfile(f, n_trips)
         t_service = array("B"); t_service.fromfile(f, n_trips)
         t_start = array("I"); t_start.fromfile(f, n_trips)
         t_offset = array("I"); t_offset.fromfile(f, n_trips)
         t_nstops = array("H"); t_nstops.fromfile(f, n_trips)
+        t_headsign = array("H"); t_headsign.fromfile(f, n_trips)
     with open(os.path.join(D, "stoptimes.bin"), "rb") as f:
         magic, n_rows = struct.unpack("<4sI", f.read(8))
-        assert magic == b"KHT1", magic
+        assert magic == b"KHT2", magic
         st_stop = array("H"); st_stop.fromfile(f, n_rows)
         st_arr = array("H"); st_arr.fromfile(f, n_rows)
-    return stops, routes, meta, (t_route, t_service, t_start, t_offset, t_nstops), (st_stop, st_arr)
+    return (stops, routes, meta, headsigns,
+            (t_route, t_service, t_start, t_offset, t_nstops, t_headsign), (st_stop, st_arr))
 
 
 def hhmm(sec: int) -> str:
@@ -41,12 +44,12 @@ def hhmm(sec: int) -> str:
 
 def main() -> int:
     want = sys.argv[1] if len(sys.argv) > 1 else "1"
-    stops, routes, meta, T, S = load()
-    t_route, t_service, t_start, t_offset, t_nstops = T
+    stops, routes, meta, headsigns, T, S = load()
+    t_route, t_service, t_start, t_offset, t_nstops, t_headsign = T
     st_stop, st_arr = S
     print(f"meta: {meta['counts']}")
     print(f"bounds: {meta['bounds']}")
-    assert len(t_route) == len(t_start) == len(t_offset) == len(t_nstops)
+    assert len(t_route) == len(t_start) == len(t_offset) == len(t_nstops) == len(t_headsign)
 
     # 1. every stop_time row decodes to a valid stop and non-decreasing time
     bad = 0
@@ -70,16 +73,20 @@ def main() -> int:
         for ti in (tripidx[0], tripidx[len(tripidx) // 2]):
             off, n = t_offset[ti], t_nstops[ti]
             start = t_start[ti]
+            h = t_headsign[ti]
+            head = f" → {headsigns[h][3]}" if h != 0xFFFF else ""
             print(f"\n  trip #{ti} service={t_service[ti]} stops={n} "
                   f"start={hhmm(start)} end={hhmm(start + st_arr[off + n - 1])} "
-                  f"duration={st_arr[off + n - 1] // 60} min")
+                  f"duration={st_arr[off + n - 1] // 60} min{head}")
             prev_idx = -9999
             for k in range(n):
                 packed = st_stop[off + k]
                 idx = (prev_idx + (packed & 0x1FFF) - 3605) if k else (packed & 0x1FFF) - 3605
                 prev_idx = idx
                 if k < 4 or k >= n - 3:
-                    print(f"    {k + 1:3d} {hhmm(start + st_arr[off + k])}  {stops[idx][3][:46]}")
+                    tc = stops[idx][4] if len(stops[idx]) > 4 and stops[idx][4] else ""
+                    print(f"    {k + 1:3d} {hhmm(start + st_arr[off + k])}  "
+                          f"{stops[idx][3][:40]:42s} {tc}")
                 elif k == 4:
                     print("        ...")
 

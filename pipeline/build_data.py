@@ -63,6 +63,8 @@ EARTH_R = 6371000.0
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CACHE = os.environ.get("KHH_CACHE", os.path.join(ROOT, ".gtfs-cache"))
 OUT = os.path.join(ROOT, "data")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import kmb_api  # noqa: E402  (local module, needs the path insert above)
 
 
 def log(msg: str) -> None:
@@ -237,7 +239,14 @@ def main() -> int:
     n_rows = sum(len(v) for v in stop_times.values())
     log(f"      {n_rows} rows, reconstructed {blanks} intermediate times over {len(used_stop_ids)} stops")
 
-    log("[5/7] calendars")
+    log("[5/8] stop index")
+    stop_list, stop_index = [], {}
+    for sid in sorted(used_stop_ids, key=lambda x: int(x) if x.isdigit() else 0):
+        lat, lon = coords[sid]
+        stop_index[sid] = len(stop_list)
+        stop_list.append([sid, round(lat, 5), round(lon, 5), names[sid]])
+
+    log("[5/8] calendars")
     calendar = {}
     for c in rows("calendar.txt"):
         if c["service_id"] not in service_ids:
@@ -248,19 +257,101 @@ def main() -> int:
     cal_dates = [[c["service_id"], int(c["date"]), int(c["exception_type"])]
                  for c in rows("calendar_dates.txt") if c["service_id"] in service_ids]
 
-    log("[6/7] packing")
-    stop_list, stop_index = [], {}
-    for sid in sorted(used_stop_ids, key=lambda x: int(x) if x.isdigit() else 0):
-        lat, lon = coords[sid]
-        stop_index[sid] = len(stop_list)
-        stop_list.append([sid, round(lat, 5), round(lon, 5), names[sid]])
+    log("[7/8] Chinese names + headsigns from the KMB/LWB API")
+    matched = kmb_api.match_stops(stop_list)
+    for row in stop_list:
+        hit = matched.get(str(row[0]))
+        row.append(hit["name_tc"] if hit else None)
+    log(f"      {len(matched)} / {len(stop_list)} stops matched to the operator feed "
+        f"({100 * len(matched) / len(stop_list):.1f}%)")
 
+    # route-bound-service variants, with their Chinese terminu
+    variants: dict[str, list[dict]] = {}
+    api_routes = {(r["route"], r["bound"], r["service_type"]): r for r in kmb_api.routes()}
+    seqs_rows: dict[tuple[str, str, str], list[tuple[int, str]]] = {}
+    for rs in kmb_api.get("/route-stop", cache_name="all_route_stops", ttl=24 * 3600)["data"]:
+        seqs_rows.setdefault((rs["route"], rs["bound"], rs["service_type"]), []).append(
+            (int(rs["seq"]), rs["stop"]))
+    seqs: dict[tuple[str, str, str], list[str]] = {
+        k: [s for _n, s in sorted(v)] for k, v in seqs_rows.items()}
+    for key, stops_in_order in seqs.items():
+        meta_r = api_routes.get(key)
+        if not meta_r:
+            continue
+        variants.setdefault(meta_r["route"], []).append({
+            "bound": meta_r["bound"],
+            "service_type": meta_r["service_type"],
+            "first": stops_in_order[0],
+            "last": stops_in_order[-1],
+            "orig_tc": meta_r["orig_tc"],
+            "dest_tc": meta_r["dest_tc"],
+        })
+
+    headsigns: list[list] = []
+    headsign_index: dict[tuple, int] = {}
+    trip_headsign: dict[str, int] = {}
+    ambiguous = 0
+    route_short = {r["route_id"]: r["route_short_name"] for r in routes}
+
+    def order_score(trip_stop_ids: list[str], variant_stops: list[str]) -> int:
+        """How many of the trip's stops the variant contains, in order.
+
+        Each TD stop may sit near several operator kerbs, so the trip stop is
+        aligned to whichever nearby kerb the variant actually serves.
+        """
+        pos = {sid: i for i, sid in enumerate(variant_stops)}
+        last, hit = -1, 0
+        for sid in trip_stop_ids:
+            hit_info = matched.get(sid)
+            if not hit_info:
+                continue
+            best = -1
+            for op_stop in hit_info["near"]:
+                i = pos.get(op_stop)
+                if i is not None and last < i and (best < 0 or i < best):
+                    best = i
+            if best >= 0:
+                hit += 1
+                last = best
+        return hit
+
+    for trip in trips:
+        arr = stop_times.get(trip["trip_id"])
+        if not arr:
+            continue
+        arr.sort(key=lambda x: x[0])
+        cands = variants.get(route_short[trip["route_id"]], [])
+        if not cands:
+            continue
+        trip_stops = [sid for _seq, _sec, sid, _pu, _do in arr]
+        best, best_score = None, 0
+        for v in cands:
+            sc = order_score(trip_stops, seqs[(route_short[trip["route_id"]],
+                                               v["bound"], v["service_type"])])
+            if sc > best_score:
+                best, best_score = v, sc
+            elif sc == best_score and sc > 0:
+                ambiguous += 1
+        if best is None or best_score < max(2, len(trip_stops) // 2):
+            continue
+        key = (route_short[trip["route_id"]], best["bound"], best["orig_tc"], best["dest_tc"])
+        idx = headsign_index.get(key)
+        if idx is None:
+            idx = len(headsigns)
+            headsign_index[key] = idx
+            headsigns.append([key[0], key[1], key[2], key[3]])
+        trip_headsign[trip["trip_id"]] = idx
+    log(f"      {len(trip_headsign)} / {len(trips)} trips carry a Chinese headsign "
+        f"({len(headsigns)} distinct, {ambiguous} ambiguous matches)")
+
+    log("[8/8] packing")
     route_order = sorted(routes, key=lambda r: (r["agency_id"], r["route_short_name"], r["route_id"]))
     route_index = {r["route_id"]: i for i, r in enumerate(route_order)}
     service_index = {sid: i for i, sid in enumerate(service_ids)}
 
     t_route, t_service, t_start = array("H"), array("B"), array("I")
-    t_offset, t_nstops = array("I"), array("H")
+    t_offset, t_nstops, t_headsign = array("I"), array("H"), array("H")
+
     st_stop, st_arr = array("H"), array("H")
 
     n_stopts = 0
@@ -275,6 +366,7 @@ def main() -> int:
         t_start.append(start)
         t_offset.append(n_stopts)
         t_nstops.append(len(arr))
+        t_headsign.append(trip_headsign.get(trip["trip_id"], 0xFFFF))
         prev = 0
         for seq, sec, sid, pickup, dropoff in arr:
             idx = stop_index[sid]
@@ -286,11 +378,11 @@ def main() -> int:
             n_stopts += 1
 
     with open(os.path.join(OUT, "trips.bin"), "wb") as f:
-        f.write(struct.pack("<4sII", b"KHH1", len(t_route), n_stopts))
+        f.write(struct.pack("<4sII", b"KHH2", len(t_route), n_stopts))
         t_route.tofile(f); t_service.tofile(f); t_start.tofile(f)
-        t_offset.tofile(f); t_nstops.tofile(f)
+        t_offset.tofile(f); t_nstops.tofile(f); t_headsign.tofile(f)
     with open(os.path.join(OUT, "stoptimes.bin"), "wb") as f:
-        f.write(struct.pack("<4sI", b"KHT1", n_stopts))
+        f.write(struct.pack("<4sI", b"KHT2", n_stopts))
         st_stop.tofile(f); st_arr.tofile(f)
 
     # walking transfers: every pair of distinct stops within WALK_RADIUS_M
@@ -324,12 +416,14 @@ def main() -> int:
         f.write(struct.pack("<4sII", b"KHW1", len(stop_list), n_walk))
         w_off.tofile(f); w_pairs.tofile(f); w_metres.tofile(f)
 
-    log("[7/7] writing json")
+    log("[8/8] writing json")
     with open(os.path.join(OUT, "stops.json"), "w", encoding="utf-8") as f:
         json.dump(stop_list, f, ensure_ascii=False, separators=(",", ":"))
     with open(os.path.join(OUT, "routes.json"), "w", encoding="utf-8") as f:
         json.dump([[r["route_id"], r["route_short_name"], r["route_long_name"], r["agency_id"]]
                    for r in route_order], f, ensure_ascii=False, separators=(",", ":"))
+    with open(os.path.join(OUT, "headsigns.json"), "w", encoding="utf-8") as f:
+        json.dump(headsigns, f, ensure_ascii=False, separators=(",", ":"))
     with open(os.path.join(OUT, "calendar.json"), "w", encoding="utf-8") as f:
         json.dump({"services": service_ids, "calendar": calendar, "exceptions": cal_dates},
                   f, separators=(",", ":"))
@@ -339,7 +433,11 @@ def main() -> int:
         "feed": FEED_BASE,
         "agencies": [{"id": a, "name": agencies.get(a, a)} for a in sorted(ALLOWED_AGENCIES)],
         "counts": {"routes": len(route_order), "trips": len(t_route), "stop_times": n_stopts,
-                   "stops": len(stop_list), "walk_links": n_walk, "times_reconstructed": blanks},
+                   "stops": len(stop_list), "walk_links": n_walk, "times_reconstructed": blanks,
+                   "headsigns": len(headsigns),
+                   "stops_with_chinese_name": sum(1 for s in stop_list if len(s) > 4 and s[4]),
+                   "trips_with_headsign": sum(1 for h in t_headsign if h != 0xFFFF)},
+        "names_source": "data.etabus.gov.hk (KMB/LWB open data API), matched by coordinate",
         "walk_radius_m": WALK_RADIUS_M,
         "bounds": [min(lats), min(lons), max(lats), max(lons)],
         "caveats": [

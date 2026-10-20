@@ -22,8 +22,24 @@ It covers every HK mode; the pipeline keeps only KMB/LWB.
 | stop_times rows | 525,044 |
 | stops | 3,605 |
 | stop↔stop walking links ≤400 m | 39,314 |
-| browser payload | **2.84 MB** raw → **380 KB** over the wire (Pages serves gzip) |
+| browser payload | **3.02 MB** raw → ~390 KB over the wire (Pages serves gzip) |
 | pipeline runtime | ~5 s locally |
+
+### Chinese names and headsigns
+
+The TD feed is English-only, so names come from the KMB/LWB open-data API
+(`data.etabus.gov.hk`, one namespace for both operators), joined by coordinate:
+
+- **3,352 / 3,605 stops (93.0 %)** get a Traditional Chinese name (`name_tc`),
+  median match distance 10 m
+- **20,088 / 22,931 trips (87.6 %)** get a Chinese headsign (`orig_tc → dest_tc`),
+  via per-trip alignment against the operator's route-stop sequences
+- 1,218 distinct headsigns; 4 routes (K12/K14/K17/K18) are absent from the API
+
+Stop ids are two different namespaces (TD integers vs operator 16-hex), and a
+single TD stop can sit next to several operator kerbs at an interchange — so the
+matcher keeps *all* kerbs within 40 m and aligns trips against them, rather than
+taking the nearest one.
 
 **The catch:** TD timestamps only the *first and last* stop of each trip — 91 %
 of intermediate times are blank. Trip departure times and total run times are
