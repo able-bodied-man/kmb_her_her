@@ -22,7 +22,7 @@ It covers every HK mode; the pipeline keeps only KMB/LWB.
 | stop_times rows | 525,044 |
 | stops | 3,605 |
 | stop↔stop walking links ≤400 m | 39,314 |
-| browser payload | **2.84 MB** raw / ~1 MB gzipped |
+| browser payload | **2.84 MB** raw → **380 KB** over the wire (Pages serves gzip) |
 | pipeline runtime | ~5 s locally |
 
 **The catch:** TD timestamps only the *first and last* stop of each trip — 91 %
