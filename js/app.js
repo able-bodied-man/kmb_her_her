@@ -125,6 +125,73 @@ function searchStops(q, limit = 8) {
   return starts.concat(contains).slice(0, limit);
 }
 
+/* --------------------------------------------------------------- place search
+ * Stops are searched locally and instantly. Anything that is not a stop (a mall,
+ * a building, an address) goes to an OSM geocoder, restricted to the HK bounding
+ * box: Photon first because its Hong Kong coverage of Chinese POI names is good
+ * and it filters by bbox cleanly; Nominatim as a fallback when Photon is empty,
+ * only on an explicit submit (its usage policy forbids autocomplete).
+ */
+const HK_BBOX = '113.83,22.15,114.45,22.57';
+const placeCache = new Map();
+
+function inHK(lat, lon) {
+  return lat > 22.15 && lat < 22.57 && lon > 113.83 && lon < 114.45;
+}
+
+function photonResult(f, fallbackName) {
+  const p = f.properties || {};
+  const [lon, lat] = f.geometry.coordinates;
+  if (!inHK(lat, lon)) return null;
+  const detail = [p.street, p.district || p.city || p.county, p.postcode].filter(Boolean).join(' · ');
+  return { kind: 'place', name: p.name || fallbackName, detail, lat, lon, source: 'Photon' };
+}
+
+async function searchPlaces(q) {
+  const key = q.trim();
+  if (key.length < 2) return [];
+  if (placeCache.has(key)) return placeCache.get(key);
+  let out = [];
+  try {
+    const url = `https://photon.komoot.io/api/?q=${encodeURIComponent(key)}&limit=6&lang=default&bbox=${HK_BBOX}`;
+    const r = await fetch(url);
+    if (r.ok) {
+      const d = await r.json();
+      out = (d.features || []).map(f => photonResult(f, key)).filter(Boolean).slice(0, 6);
+    }
+  } catch (e) {
+    console.warn('Photon unavailable', e);
+  }
+  placeCache.set(key, out);
+  return out;
+}
+
+async function searchPlacesNominatim(q) {
+  const key = q.trim();
+  if (key.length < 2) return [];
+  const cacheKey = 'nom:' + key;
+  if (placeCache.has(cacheKey)) return placeCache.get(cacheKey);
+  let out = [];
+  try {
+    const url = 'https://nominatim.openstreetmap.org/search?format=jsonv2&limit=5&accept-language=zh-HK'
+      + `&viewbox=${HK_BBOX.split(',').slice(0, 1)},${HK_BBOX.split(',')[3]},${HK_BBOX.split(',')[2]},${HK_BBOX.split(',')[1]}&bounded=1`
+      + `&q=${encodeURIComponent(key)}`;
+    const r = await fetch(url, { headers: { 'Accept-Language': 'zh-HK' } });
+    if (r.ok) {
+      const d = await r.json();
+      out = d.map(x => ({
+        kind: 'place', name: x.name || key,
+        detail: (x.display_name || '').split(',').slice(1, 3).join(' · '),
+        lat: parseFloat(x.lat), lon: parseFloat(x.lon), source: 'Nominatim',
+      })).filter(x => inHK(x.lat, x.lon));
+    }
+  } catch (e) {
+    console.warn('Nominatim unavailable', e);
+  }
+  placeCache.set(cacheKey, out);
+  return out;
+}
+
 /* ------------------------------------------------------------------- service */
 function activeServices(date) {
   const bits = 1 << ((date.getDay() + 6) % 7);
@@ -329,6 +396,12 @@ function plan(origin, dest, departSec, options = {}) {
   }
   legs.reverse();
 
+  // walk from the last stop to the actual destination point (added before the
+  // merge so it collapses with an alighting walk into one leg)
+  if (best.walk > 0) {
+    legs.push({ type: 'walk', metres: best.walk, toDest: true });
+  }
+
   // collapse chains of walking legs (a multi-hop walk is one walk to the rider)
   const merged = [];
   for (const leg of legs) {
@@ -360,12 +433,6 @@ function plan(origin, dest, departSec, options = {}) {
       leg.pattern = patternOfTrip(ti);
       t = leg.end;
     }
-  }
-  // walk from the last stop to the actual destination point
-  if (best.walk > 0) {
-    const seconds = Math.round(best.walk / WALK_SPEED);
-    merged.push({ type: 'walk', metres: best.walk, seconds, start: t, end: t + seconds, toDest: true });
-    t += seconds;
   }
   return { depart: departSec, arrive: t, legs: merged };
 }
@@ -483,14 +550,33 @@ function setupField(which) {
   const input = document.getElementById(`${which}-input`);
   const list = document.getElementById(`${which}-suggest`);
   const picked = document.getElementById(`${which}-picked`);
-  let items = [], cursor = -1;
+  let items = [], cursor = -1, placeSeq = 0, timer = null;
 
   const render = () => {
     list.innerHTML = '';
+    let lastKind = null;
     items.forEach((s, idx) => {
+      const groupKind = s.kind === 'note' ? 'place' : s.kind;
+      if (groupKind !== lastKind) {
+        lastKind = groupKind;
+        const h = document.createElement('li');
+        h.className = 'group';
+        h.textContent = groupKind === 'stop' ? '巴士站' : '地點（網上搜尋）';
+        list.appendChild(h);
+      }
       const li = document.createElement('li');
       if (idx === cursor) li.className = 'active';
-      li.innerHTML = `<span>${s.tc || s.en}</span><span class="en">${s.tc ? s.en : ''}</span>`;
+      if (s.kind === 'note') {
+        li.className = 'note';
+        li.textContent = s.text;
+        list.appendChild(li);
+        return;
+      }
+      if (s.kind === 'stop') {
+        li.innerHTML = `<span>${s.tc || s.en}</span><span class="en">${s.tc ? s.en : ''}</span>`;
+      } else {
+        li.innerHTML = `<span>📍 ${s.name}</span><span class="en">${s.detail || ''}</span>`;
+      }
       li.addEventListener('mousedown', (e) => { e.preventDefault(); choose(s); });
       list.appendChild(li);
     });
@@ -498,31 +584,76 @@ function setupField(which) {
   };
 
   const choose = (s) => {
-    state[which] = { stop: s.i };
-    input.value = s.tc || s.en;
-    picked.hidden = false;
-    picked.textContent = `已選：${stopName(s.i)}`;
+    if (!s || s.kind === 'note') return;
+    if (s.kind === 'place') {
+      state[which] = { lat: s.lat, lon: s.lon, label: s.name };
+      input.value = s.name;
+      picked.hidden = false;
+      picked.textContent = `已選：${s.name}` + (s.detail ? `（${s.detail}）` : '');
+    } else {
+      state[which] = { stop: s.i };
+      input.value = s.tc || s.en;
+      picked.hidden = false;
+      picked.textContent = `已選：${stopName(s.i)}`;
+    }
     list.hidden = true;
     items = [];
+    cursor = -1;
     maybeRedraw();
   };
 
+  // stops are instant; places arrive from the geocoder after a pause
+  const refreshPlaces = async (query) => {
+    const seq = ++placeSeq;
+    if (query.trim().length < 2) return;
+    const stopsNow = searchStops(query).map(s => ({ ...s, kind: 'stop' }));
+    items = stopsNow.concat([{ kind: 'note', text: '搜尋地點中…' }]);
+    cursor = stopsNow.length ? 0 : -1;
+    render();
+    const places = await searchPlaces(query);
+    if (seq !== placeSeq) return;                      // a newer keystroke won
+    if (!picked.hidden) return;                        // a choice was already made
+    items = stopsNow.concat(places);
+    cursor = items.length ? 0 : -1;
+    render();
+  };
+
   input.addEventListener('input', () => {
-    items = searchStops(input.value);
+    const q = input.value;
+    items = searchStops(q).map(s => ({ ...s, kind: 'stop' }));
     cursor = items.length ? 0 : -1;
     render();
     picked.hidden = true;
     state[which] = null;
     maybeRedraw();
+    clearTimeout(timer);
+    if (q.trim().length >= 2) timer = setTimeout(() => refreshPlaces(q), 450);
   });
-  input.addEventListener('keydown', (e) => {
-    if (list.hidden) return;
-    if (e.key === 'ArrowDown') { cursor = Math.min(cursor + 1, items.length - 1); render(); e.preventDefault(); }
-    else if (e.key === 'ArrowUp') { cursor = Math.max(cursor - 1, 0); render(); e.preventDefault(); }
-    else if (e.key === 'Enter' && items[cursor]) { choose(items[cursor]); e.preventDefault(); }
-    else if (e.key === 'Escape') { list.hidden = true; }
+
+  input.addEventListener('keydown', async (e) => {
+    if (e.key === 'ArrowDown' && items.length) { cursor = Math.min(cursor + 1, items.length - 1); render(); e.preventDefault(); return; }
+    if (e.key === 'ArrowUp' && items.length) { cursor = Math.max(cursor - 1, 0); render(); e.preventDefault(); return; }
+    if (e.key === 'Escape') { list.hidden = true; return; }
+    if (e.key !== 'Enter') return;
+    e.preventDefault();
+    if (items[cursor] && items[cursor].kind !== 'note') { choose(items[cursor]); return; }
+    if (items.some(i => i.kind === 'place')) { choose(items.find(i => i.kind === 'place')); return; }
+    // nothing local: ask Nominatim once, on explicit submit
+    const q = input.value.trim();
+    if (q.length < 2) return;
+    setStatus(`搜尋「${q}」…`);
+    const places = await searchPlacesNominatim(q);
+    if (places.length) {
+      items = places;
+      cursor = 0;
+      render();
+      choose(places[0]);
+      setStatus(`已找到「${places[0].name}」，再按「規劃路線」。`);
+    } else {
+      setStatus(`找不到「${q}」，請試其他名稱，或在地圖上點選位置。`);
+    }
   });
-  input.addEventListener('blur', () => setTimeout(() => { list.hidden = true; }, 120));
+  input.addEventListener('blur', () => setTimeout(() => { list.hidden = true; }, 150));
 
   document.getElementById(`${which}-map`).addEventListener('click', (e) => {
     state.picking = which;
@@ -531,11 +662,11 @@ function setupField(which) {
     setStatus('請在地圖上點選位置…');
   });
 
-  return { setPoint(lat, lon) {
-    state[which] = { lat, lon };
-    input.value = `${lat.toFixed(5)}, ${lon.toFixed(5)}`;
+  return { setPoint(lat, lon, label) {
+    state[which] = { lat, lon, label: label || null };
+    input.value = label || `${lat.toFixed(5)}, ${lon.toFixed(5)}`;
     picked.hidden = false;
-    picked.textContent = '已選：地圖上的座標';
+    picked.textContent = label ? `已選：${label}` : '已選：地圖上的座標';
     maybeRedraw();
   } };
 }
@@ -546,6 +677,19 @@ function pickPoint(which, lat, lon) {
   (which === 'from' ? fieldFrom : fieldTo).setPoint(lat, lon);
   setStatus('已在地圖上選取位置。');
   maybeRedraw();
+}
+
+function locate() {
+  if (!navigator.geolocation) { setStatus('此瀏覽器不支援定位。'); return; }
+  setStatus('正在取得位置…');
+  navigator.geolocation.getCurrentPosition(
+    (pos) => {
+      fieldFrom.setPoint(pos.coords.latitude, pos.coords.longitude, '我的位置');
+      setStatus('已使用你的位置作為起點。');
+    },
+    (err) => setStatus(`無法取得位置：${err.message}`),
+    { enableHighAccuracy: true, timeout: 10000, maximumAge: 60000 },
+  );
 }
 
 function maybeRedraw() {
@@ -621,6 +765,17 @@ function run() {
   const container = document.getElementById('results');
   container.innerHTML = '';
   const depart = timeFromInput();
+
+  // a coordinate origin/destination only works if a stop is walkable from it
+  for (const [sel, name] of [[state.from, '起點'], [state.to, '終點']]) {
+    if (sel && sel.stop === undefined && stopsNear(sel.lat, sel.lon, ORIGIN_WALK_M).length === 0) {
+      container.innerHTML = `<div class="empty">${name} ${ORIGIN_WALK_M} 米範圍內沒有九巴／龍運車站，
+        這個位置無法只用九巴／龍運及步行到達。</div>`;
+      setStatus('沒有結果。');
+      return;
+    }
+  }
+
   const t0 = performance.now();
   const first = plan(state.from, state.to, depart);
   if (!first) {
@@ -649,11 +804,14 @@ window.addEventListener('DOMContentLoaded', () => {
   document.getElementById('now-btn').addEventListener('click', () => {
     document.getElementById('time-input').value = hhmmNow();
   });
+  const geoBtn = document.getElementById('from-geo');
+  if (geoBtn) geoBtn.addEventListener('click', locate);
   document.getElementById('time-input').value = hhmmNow();
   document.getElementById('go').addEventListener('click', run);
   document.getElementById('go').disabled = true;
   // handle for debugging / tests (no effect on the UI)
-  window.__khh = { state, plan, searchStops, hhmm, stopName, routeShort, headsignText, run };
+  window.__khh = { state, plan, searchStops, searchPlaces, hhmm, stopName, routeShort,
+                   headsignText, run, stopsNear };
   boot().catch(err => {
     console.error(err);
     setStatus(`載入失敗：${err.message}`);
