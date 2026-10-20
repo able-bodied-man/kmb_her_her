@@ -1,0 +1,4 @@
+# generated routing data (rebuilt in CI from the TD GTFS feed)
+data/
+# raw feed cache
+.gtfs-cache/

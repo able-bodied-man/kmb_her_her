@@ -1,0 +1,365 @@
+#!/usr/bin/env python3
+"""
+kmb_her_her data pipeline.
+
+Source: Transport Department "Headway information of public transport services"
+(https://static.data.gov.hk/td/pt-headway-en/, GTFS, refreshed biweekly).
+
+That feed covers every HK mode (MTR, Citybus, minibus, tram, ferry, KMB, LWB ...).
+This pipeline reduces it to what a KMB/LWB pass holder can actually ride —
+KMB, LWB and the jointly operated KMB+CTB / LWB+CTB routes — and reshapes it
+into compact arrays a browser can load and route over.
+
+IMPORTANT PROPERTY OF THE SOURCE FEED
+TD publishes only the *first and last* stop time of each trip (plus a handful of
+timepoints); every intermediate stop is blank. Journey duration per trip is
+therefore known exactly, but intermediate times have to be reconstructed:
+this pipeline spreads the measured duration over the stops proportionally to
+inter-stop distance, with a fixed dwell allowance per stop. Intermediate times
+are therefore ESTIMATES (typically ±1-2 min); departure times at the first stop
+and total run time are exact.
+
+Output (written to <repo>/data/):
+  meta.json        counts, feed timestamp, bounds, caveats
+  stops.json       [[stop_id, lat, lon, name], ...]
+  routes.json      [[route_id, short_name, long_name, agency_id], ...]
+  calendar.json    {services:[...], calendar:{...}, exceptions:[...]}
+  trips.bin        columnar: u16 route, u8 service, u32 start_sec,
+                             u32 stop_time_offset, u16 n_stops
+  stoptimes.bin    columnar: u16 (stop_delta<<3 | flags), u16 seconds_since_start
+  walk.bin         walking-transfer index: u32 offsets + (u16 stop, u16 metres)
+
+Stdlib only, so it runs on a bare CI runner.
+"""
+from __future__ import annotations
+
+import csv
+import json
+import math
+import os
+import re
+import struct
+import sys
+import urllib.request
+from array import array
+from datetime import datetime, timezone
+
+FEED_BASE = "https://static.data.gov.hk/td/pt-headway-en"
+FEED_FILES = [
+    "agency.txt", "routes.txt", "stops.txt", "trips.txt", "stop_times.txt",
+    "calendar.txt", "calendar_dates.txt", "frequencies.txt",
+]
+
+# Agencies a KMB/LWB pass holder can ride. The joint KMB+CTB / LWB+CTB routes
+# are partly operated by KMB/LWB, so they are offered (agency is visible in
+# routes.json so the UI can flag them).
+ALLOWED_AGENCIES = {"KMB", "LWB", "KMB+CTB", "LWB+CTB"}
+
+WALK_RADIUS_M = 400.0          # stop <-> stop walking transfer
+DWELL_SECS = 20                # assumed dwell at each intermediate stop
+DEFAULT_KMH = 19.0             # fallback speed when a trip has a single timestamp
+EARTH_R = 6371000.0
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CACHE = os.environ.get("KHH_CACHE", os.path.join(ROOT, ".gtfs-cache"))
+OUT = os.path.join(ROOT, "data")
+
+
+def log(msg: str) -> None:
+    print(msg, flush=True)
+
+
+def fetch(name: str) -> str:
+    os.makedirs(CACHE, exist_ok=True)
+    path = os.path.join(CACHE, name)
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        url = f"{FEED_BASE}/{name}"
+        log(f"  downloading {name} ...")
+        tmp = path + ".part"
+        with urllib.request.urlopen(url, timeout=300) as r, open(tmp, "wb") as f:
+            while chunk := r.read(1 << 20):
+                f.write(chunk)
+        os.replace(tmp, path)
+    return path
+
+
+def rows(name: str):
+    with open(fetch(name), encoding="utf-8-sig", newline="") as f:
+        yield from csv.DictReader(f)
+
+
+def gtfs_secs(t: str) -> int:
+    h, m, s = (int(x) for x in t.split(":"))
+    return h * 3600 + m * 60 + s
+
+
+def clean_stop_name(raw: str) -> str:
+    """TD packs one name per agency into stop_name, pipe separated."""
+    parts = [p.strip() for p in raw.split("|")]
+    for pref in ("[KMB]", "[LWB]", "[KMB+CTB]", "[LWB+CTB]"):
+        for p in parts:
+            if p.startswith(pref):
+                return re.sub(r"\s+", " ", p[len(pref):].replace("<BR>", " ")).strip(" /")
+    first = parts[0] if parts else raw
+    return re.sub(r"\s+", " ", re.sub(r"^\[[^\]]+\]\s*", "", first).replace("<BR>", " ")).strip()
+
+
+def haversine(lat1, lon1, lat2, lon2) -> float:
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = p2 - p1
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * EARTH_R * math.asin(min(1.0, a ** 0.5))
+
+
+def interpolate(secs: list[int | None], lats: list[float], lons: list[float]) -> int:
+    """Fill the blank times of one trip in place; return how many were filled.
+
+    Known times (first/last stop, occasional timepoints) are kept verbatim.
+    Each run of blanks between two anchors is spread over the measured gap in
+    proportion to cumulative inter-stop distance, minus a dwell allowance.
+    """
+    n = len(secs)
+    if n == 0:
+        return 0
+    anchors = [i for i, s in enumerate(secs) if s is not None]
+
+    # distance along the trip, in metres
+    cum = [0.0]
+    for i in range(1, n):
+        cum.append(cum[-1] + haversine(lats[i - 1], lons[i - 1], lats[i], lons[i]))
+
+    filled = 0
+    if not anchors:                                  # nothing at all: give up on this trip
+        return 0
+    if len(anchors) == 1:                            # only one timestamp: fall back to a speed
+        a = anchors[0]
+        secs[a] = secs[a]
+        for i in range(n):
+            if i == a:
+                continue
+            dist_km = abs(cum[i] - cum[a]) / 1000.0
+            est = DEFAULT_KMH * 1000 / 3600
+            delta = dist_km * 1000 / est + DWELL_SECS * abs(i - a)
+            secs[i] = int(round(secs[a] + (delta if i > a else -delta)))
+            filled += 1
+    else:
+        # leading blanks before the first anchor
+        first = anchors[0]
+        for i in range(first):
+            dist_km = (cum[first] - cum[i]) / 1000.0
+            secs[i] = int(round(secs[first] - dist_km * 1000 / (DEFAULT_KMH * 1000 / 3600)
+                                - DWELL_SECS * (first - i)))
+            filled += 1
+        # gaps between anchors
+        for lo, hi in zip(anchors, anchors[1:]):
+            if hi - lo == 1:
+                continue
+            gap = secs[hi] - secs[lo]
+            inner = list(range(lo + 1, hi))
+            span = cum[hi] - cum[lo]
+            dwell_budget = DWELL_SECS * len(inner)
+            run_budget = max(gap - dwell_budget, 0.25 * gap if gap > 0 else 1.0)
+            for k, i in enumerate(inner):
+                frac = ((cum[i] - cum[lo]) / span) if span > 0 else (k + 1) / (len(inner) + 1)
+                secs[i] = int(round(secs[lo] + dwell_budget * (k + 1) / len(inner) + run_budget * frac))
+                filled += 1
+        # trailing blanks after the last anchor
+        last = anchors[-1]
+        for i in range(last + 1, n):
+            dist_km = (cum[i] - cum[last]) / 1000.0
+            secs[i] = int(round(secs[last] + dist_km * 1000 / (DEFAULT_KMH * 1000 / 3600)
+                                + DWELL_SECS * (i - last)))
+            filled += 1
+    # enforce monotonic, non-negative times
+    prev = -1
+    for i in range(n):
+        v = int(secs[i])
+        if v < prev:
+            v = prev
+        if v < 0:
+            v = 0
+        secs[i] = v
+        prev = v
+    return filled
+
+
+def main() -> int:
+    os.makedirs(OUT, exist_ok=True)
+
+    log("[1/7] agencies & routes")
+    agencies = {r["agency_id"]: r["agency_name"] for r in rows("agency.txt")}
+    routes = [r for r in rows("routes.txt") if r["agency_id"] in ALLOWED_AGENCIES]
+    route_ids = {r["route_id"] for r in routes}
+    log(f"      {len(routes)} routes from {sorted(ALLOWED_AGENCIES)}")
+
+    log("[2/7] trips")
+    trips = [t for t in rows("trips.txt") if t["route_id"] in route_ids]
+    trip_ids = {t["trip_id"] for t in trips}
+    service_ids = sorted({t["service_id"] for t in trips})
+    log(f"      {len(trips)} trips, {len(service_ids)} service ids")
+
+    log("[3/7] stops")
+    coords: dict[str, tuple[float, float]] = {}
+    names: dict[str, str] = {}
+    for s in rows("stops.txt"):
+        coords[s["stop_id"]] = (float(s["stop_lat"]), float(s["stop_lon"]))
+        names[s["stop_id"]] = clean_stop_name(s["stop_name"])
+    log(f"      {len(coords)} stops in feed")
+
+    log("[4/7] stop_times (the 50 MB file; 91% of times are blank and get reconstructed)")
+    raw: dict[str, list[tuple[int, str, str, str, int, int]]] = {}
+    for st in rows("stop_times.txt"):
+        tid = st["trip_id"]
+        if tid not in trip_ids:
+            continue
+        raw.setdefault(tid, []).append((
+            int(st["stop_sequence"]),
+            st["arrival_time"] or st["departure_time"] or "",
+            st["stop_id"],
+            int(st["pickup_type"] or 0),
+            int(st["drop_off_type"] or 0),
+        ))
+
+    stop_times: dict[str, list[tuple[int, int, str, int, int]]] = {}
+    blanks = 0
+    for tid, arr in raw.items():
+        arr.sort(key=lambda x: x[0])
+        if not arr:
+            continue
+        lats = [coords[r[2]][0] for r in arr]
+        lons = [coords[r[2]][1] for r in arr]
+        secs: list[int | None] = [gtfs_secs(r[1]) if r[1] else None for r in arr]
+        blanks += interpolate(secs, lats, lons)
+        stop_times[tid] = [(r[0], secs[i], r[2], r[3], r[4]) for i, r in enumerate(arr)]  # type: ignore[list-item]
+
+    used_stop_ids = {st[2] for arr in stop_times.values() for st in arr}
+    n_rows = sum(len(v) for v in stop_times.values())
+    log(f"      {n_rows} rows, reconstructed {blanks} intermediate times over {len(used_stop_ids)} stops")
+
+    log("[5/7] calendars")
+    calendar = {}
+    for c in rows("calendar.txt"):
+        if c["service_id"] not in service_ids:
+            continue
+        bits = sum((int(c[d]) << i) for i, d in enumerate(
+            ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")))
+        calendar[c["service_id"]] = [bits, int(c["start_date"]), int(c["end_date"])]
+    cal_dates = [[c["service_id"], int(c["date"]), int(c["exception_type"])]
+                 for c in rows("calendar_dates.txt") if c["service_id"] in service_ids]
+
+    log("[6/7] packing")
+    stop_list, stop_index = [], {}
+    for sid in sorted(used_stop_ids, key=lambda x: int(x) if x.isdigit() else 0):
+        lat, lon = coords[sid]
+        stop_index[sid] = len(stop_list)
+        stop_list.append([sid, round(lat, 5), round(lon, 5), names[sid]])
+
+    route_order = sorted(routes, key=lambda r: (r["agency_id"], r["route_short_name"], r["route_id"]))
+    route_index = {r["route_id"]: i for i, r in enumerate(route_order)}
+    service_index = {sid: i for i, sid in enumerate(service_ids)}
+
+    t_route, t_service, t_start = array("H"), array("B"), array("I")
+    t_offset, t_nstops = array("I"), array("H")
+    st_stop, st_arr = array("H"), array("H")
+
+    n_stopts = 0
+    for trip in trips:
+        arr = stop_times.get(trip["trip_id"])
+        if not arr:
+            continue
+        arr.sort(key=lambda x: x[0])
+        start = arr[0][1]
+        t_route.append(route_index[trip["route_id"]])
+        t_service.append(service_index[trip["service_id"]])
+        t_start.append(start)
+        t_offset.append(n_stopts)
+        t_nstops.append(len(arr))
+        prev = 0
+        for seq, sec, sid, pickup, dropoff in arr:
+            idx = stop_index[sid]
+            delta = idx - prev + 3605                      # 0..7210 -> 13 bits
+            flags = (1 if pickup == 0 else 0) | (2 if dropoff == 0 else 0)
+            st_stop.append((delta & 0x1FFF) | (flags << 13))
+            st_arr.append(max(0, min(65535, sec - start)))
+            prev = idx
+            n_stopts += 1
+
+    with open(os.path.join(OUT, "trips.bin"), "wb") as f:
+        f.write(struct.pack("<4sII", b"KHH1", len(t_route), n_stopts))
+        t_route.tofile(f); t_service.tofile(f); t_start.tofile(f)
+        t_offset.tofile(f); t_nstops.tofile(f)
+    with open(os.path.join(OUT, "stoptimes.bin"), "wb") as f:
+        f.write(struct.pack("<4sI", b"KHT1", n_stopts))
+        st_stop.tofile(f); st_arr.tofile(f)
+
+    # walking transfers: every pair of distinct stops within WALK_RADIUS_M
+    lats = [s[1] for s in stop_list]
+    lons = [s[2] for s in stop_list]
+    cell = 0.005
+    grid: dict[tuple[int, int], list[int]] = {}
+    for i, (la, lo) in enumerate(zip(lats, lons)):
+        grid.setdefault((int(la / cell), int(lo / cell)), []).append(i)
+    w_off = array("I", [0])
+    w_pairs, w_metres = array("H"), array("H")
+    n_walk = 0
+    for i, (la, lo) in enumerate(zip(lats, lons)):
+        gy, gx = int(la / cell), int(lo / cell)
+        found = []
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                for j in grid.get((gy + dy, gx + dx), ()):
+                    if j == i:
+                        continue
+                    d = haversine(la, lo, lats[j], lons[j])
+                    if d <= WALK_RADIUS_M:
+                        found.append((j, int(round(d))))
+        found.sort(key=lambda x: x[1])
+        for j, d in found:
+            w_pairs.append(j)
+            w_metres.append(min(d, 65535))
+            n_walk += 1
+        w_off.append(n_walk)
+    with open(os.path.join(OUT, "walk.bin"), "wb") as f:
+        f.write(struct.pack("<4sII", b"KHW1", len(stop_list), n_walk))
+        w_off.tofile(f); w_pairs.tofile(f); w_metres.tofile(f)
+
+    log("[7/7] writing json")
+    with open(os.path.join(OUT, "stops.json"), "w", encoding="utf-8") as f:
+        json.dump(stop_list, f, ensure_ascii=False, separators=(",", ":"))
+    with open(os.path.join(OUT, "routes.json"), "w", encoding="utf-8") as f:
+        json.dump([[r["route_id"], r["route_short_name"], r["route_long_name"], r["agency_id"]]
+                   for r in route_order], f, ensure_ascii=False, separators=(",", ":"))
+    with open(os.path.join(OUT, "calendar.json"), "w", encoding="utf-8") as f:
+        json.dump({"services": service_ids, "calendar": calendar, "exceptions": cal_dates},
+                  f, separators=(",", ":"))
+
+    meta = {
+        "generated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "feed": FEED_BASE,
+        "agencies": [{"id": a, "name": agencies.get(a, a)} for a in sorted(ALLOWED_AGENCIES)],
+        "counts": {"routes": len(route_order), "trips": len(t_route), "stop_times": n_stopts,
+                   "stops": len(stop_list), "walk_links": n_walk, "times_reconstructed": blanks},
+        "walk_radius_m": WALK_RADIUS_M,
+        "bounds": [min(lats), min(lons), max(lats), max(lons)],
+        "caveats": [
+            "Source feed only timestamps the first and last stop of each trip.",
+            "Intermediate stop times are reconstructed from measured trip duration "
+            "and inter-stop distance (dwell %.0fs/stop); expect +/-1-2 min." % DWELL_SECS,
+            "Trip departure times and total run times are exact.",
+        ],
+    }
+    with open(os.path.join(OUT, "meta.json"), "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
+
+    total = sum(os.path.getsize(os.path.join(OUT, n)) for n in os.listdir(OUT))
+    for n in sorted(os.listdir(OUT)):
+        log(f"      {n:18s} {os.path.getsize(os.path.join(OUT, n)) / 1e6:6.2f} MB")
+    log(f"      {'TOTAL':18s} {total / 1e6:6.2f} MB  |  "
+        f"{meta['counts']['routes']} routes, {meta['counts']['trips']} trips, "
+        f"{meta['counts']['stops']} stops, {n_walk} walking links")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
