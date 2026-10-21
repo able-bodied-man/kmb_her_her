@@ -18,7 +18,7 @@ const MAX_OFFSET_SLACK = 7200;   // guard for binary search over trip starts
 
 const state = {
   stops: [], routes: [], headsigns: [], cal: null, calIndex: {}, cards: [],
-  plans: [], sigs: [], lastDepart: 0,
+  plans: [], sigs: [], probeSig: null, lastDepart: 0,
   trips: null, st: null, walk: null, pat: null, sp: null,
   from: null, to: null,
   map: null, mapLayers: [],
@@ -562,6 +562,8 @@ function plan(origin, dest, departSec, options = {}) {
   const parent = new Array(nStops).fill(null);
   const seeded = new Uint8Array(nStops);
   const pq = new MinHeap();
+  const maxRides = options.maxRides === undefined ? Infinity : options.maxRides;
+  const ridesAt = new Uint8Array(nStops);       // buses boarded to reach each stop
 
   const origins = origin.stop !== undefined
     ? [{ stop: origin.stop, metres: 0, seconds: 0 }]
@@ -603,6 +605,7 @@ function plan(origin, dest, departSec, options = {}) {
       const v = state.sp.pair[k];
       const pi = v >>> 8, pos = v & 0xff;
       if (banned.has(pi)) continue;
+      if (ridesAt[s] + 1 > maxRides) continue;                    // ride budget spent
       if (bestBoard[pi] <= t && bestPos[pi] <= pos) continue;     // pattern already boarded better
       const ready = t + (seeded[s] ? 0 : TRANSFER_PENALTY);
       const found = findTrip(pi, pos, ready, active);
@@ -621,6 +624,7 @@ function plan(origin, dest, departSec, options = {}) {
         const arr = state.trips.start[trip] + state.st.arr[row] + shift;
         if (arr < tau[sidx] - 1e-6) {
           tau[sidx] = arr;
+          ridesAt[sidx] = ridesAt[s] + 1;
           parent[sidx] = { type: 'bus', from: s, trip, board: pos, alight: p, boardTime: dep, shift };
           pq.push(sidx, arr);
         }
@@ -1249,18 +1253,22 @@ function structureSig(p) {
  * than the best is treated as noise.
  */
 const MAX_RIDES = 3;
+let lastProbeSig = null;          // structure of the plain earliest-arrival answer
 
 function candidatePlans(origin, dest, departSec, limit = 5) {
   const out = [];
   const seen = new Set();
   const banned = new Set();
   let bestArrive = null;
-  for (let i = 0; i < limit + 12 && out.length < limit; i++) {
+  const rides = (p) => p.legs.reduce((n, l) => n + (l.type === 'bus' ? 1 : 0), 0);
+  // collect a few more than we show, so the fewest-transfer journeys are not
+  // crowded out by five fast ones that all need two changes
+  for (let i = 0; i < limit * 3 && out.length < limit * 3; i++) {
     const p = plan(origin, dest, departSec, { bannedPat: banned });
     if (!p) break;
+    if (i === 0) lastProbeSig = structureSig(p);
     const buses = p.legs.filter(l => l.type === 'bus');
-    const rides = buses.length;
-    if (rides <= MAX_RIDES) {
+    if (buses.length <= MAX_RIDES) {
       const sig = structureSig(p);
       if (!seen.has(sig)) {
         seen.add(sig);
@@ -1268,14 +1276,21 @@ function candidatePlans(origin, dest, departSec, limit = 5) {
         if (bestArrive === null || p.arrive < bestArrive) bestArrive = p.arrive;
       }
     }
-    if (!rides) break;                            // walk-only answer: nothing to vary
-    const next = buses.find(l => !banned.has(l.pattern));
-    if (!next) break;                             // every pattern already excluded
-    banned.add(next.pattern);
+    if (!buses.length) break;                      // walk-only answer: nothing to vary
+    // alternate which end of the journey is forced to change: banning the first
+    // bus explores other ways out of the origin, banning the last one explores
+    // other routes into the destination (A36 vs A33X vs A41P to the same place)
+    let target = i % 2 === 0
+      ? buses.find(l => !banned.has(l.pattern))
+      : [...buses].reverse().find(l => !banned.has(l.pattern));
+    if (!target) target = buses.find(l => !banned.has(l.pattern));
+    if (!target) break;                            // every pattern already excluded
+    banned.add(target.pattern);
     if (bestArrive !== null && p.arrive > bestArrive + 3600) break;
   }
-  out.sort((a, b) => a.arrive - b.arrive || a.depart - b.depart);
-  return out;
+  // fewest changes first, then soonest arrival
+  out.sort((a, b) => rides(a) - rides(b) || a.arrive - b.arrive);
+  return out.slice(0, limit);
 }
 
 /**
@@ -1326,7 +1341,7 @@ function run(auto = false) {
   // enough — no need to re-run ten searches every half minute.
   if (auto && state.plans && state.plans.length && state.cards.length === state.plans.length) {
     const probe = plan(state.from, state.to, depart);
-    if (probe && structureSig(probe) === state.sigs[0]) {
+    if (probe && structureSig(probe) === state.probeSig) {
       const delta = depart - state.lastDepart;
       state.plans.forEach((p, i) => refreshCard(state.cards[i], shiftPlan(p, delta)));
       state.lastDepart = depart;
@@ -1366,11 +1381,12 @@ function run(auto = false) {
   drawPlan(first);
   state.lastSignature = sig;
   state.sigs = plans.map(structureSig);
+  state.probeSig = lastProbeSig;
   state.plans = plans;
   state.lastDepart = depart;
 
   const ms = Math.round(performance.now() - t0);
-  setStatus(`以 ${hhmm(depart)} 出發計算，找到 ${plans.length} 條路線` +
+  setStatus(`以 ${hhmm(depart)} 出發計算，找到 ${plans.length} 條路線（先列最少轉車）` +
     (onlyOverLimit ? '（其餘方案需超過 2 次轉乘，已略去）' : '') +
     `，運算時間 ${ms} 毫秒` + (auto ? `；${hhmm(depart + 30)} 再更新。` : `；之後每 30 秒自動更新。`));
   if (!auto) state.cards[0].scrollIntoView({ behavior: 'smooth', block: 'nearest' });
