@@ -407,6 +407,32 @@ class MinHeap {
   }
 }
 
+/**
+ * Earliest time trip `ti` departs the stop in row `row`, at or after `after`.
+ *
+ * A trip normally runs once; a trip carrying a frequency window runs repeatedly
+ * ("every 540 s between 07:12 and 07:39"), so the k-th run is resolved here
+ * arithmetically instead of materialising the repeats in the dataset.
+ */
+function firstDep(ti, row, after) {
+  const startT = state.trips.start[ti];
+  const base = startT + state.st.arr[row];
+  let bestDep = base >= after ? base : null;
+  const windows = state.freq && state.freq.get(ti);
+  if (windows) {
+    const shift = base - startT;
+    for (const [ws, we, h] of windows) {
+      let k = Math.ceil((after - ws - shift) / h);
+      if (k < 0) k = 0;
+      const runStart = ws + k * h;
+      if (runStart > we) continue;                    // window already over
+      const t = runStart + shift;
+      if (t >= after && (bestDep === null || t < bestDep)) bestDep = t;
+    }
+  }
+  return bestDep;
+}
+
 /** Earliest catchable trip of `pattern` at `pos`, departing at/after `after`. */
 function findTrip(pi, pos, after, active) {
   const { start, offset, service } = state.trips;
@@ -425,16 +451,19 @@ function findTrip(pi, pos, after, active) {
     if (!active.has(service[ti])) continue;
     const row = offset[ti] + pos;
     if (!(state.st.packed[row] & (1 << 13))) continue;          // no pick-up here
-    const dep = start[ti] + state.st.arr[row];
-    if (dep < after) continue;
-    if (!best || dep < best.dep) best = { trip: ti, dep };
+    const dep = firstDep(ti, row, after);
+    if (dep === null) continue;
+    if (!best || dep < best.dep) {
+      // a frequency run departs later than its template trip, so remember the shift
+      best = { trip: ti, dep, offset: Math.round(dep - (start[ti] + state.st.arr[row])) };
+    }
   }
   return best;
 }
 
 function plan(origin, dest, departSec, options = {}) {
   const nStops = state.stops.length;
-  const active = activeServices(options.date || new Date());
+  const active = activeServices(options.date);
   const banned = options.bannedPat || new Set();
   const tau = new Float64Array(nStops).fill(INF);
   const parent = new Array(nStops).fill(null);
@@ -483,6 +512,7 @@ function plan(origin, dest, departSec, options = {}) {
       const found = findTrip(pi, pos, ready, active);
       if (!found) continue;
       const { trip, dep } = found;
+      const shift = found.offset || 0;                            // frequency-run displacement
       bestBoard[pi] = dep; bestPos[pi] = pos;
 
       const pStopBase = state.pat.stopOff[pi];
@@ -492,10 +522,10 @@ function plan(origin, dest, departSec, options = {}) {
         const sidx = state.pat.stops[pStopBase + p];
         const row = rowBase + p;
         if (!(state.st.packed[row] & (1 << 14))) continue;       // no set-down here
-        const arr = state.trips.start[trip] + state.st.arr[row];
+        const arr = state.trips.start[trip] + state.st.arr[row] + shift;
         if (arr < tau[sidx] - 1e-6) {
           tau[sidx] = arr;
-          parent[sidx] = { type: 'bus', from: s, trip, board: pos, alight: p, boardTime: dep };
+          parent[sidx] = { type: 'bus', from: s, trip, board: pos, alight: p, boardTime: dep, shift };
           pq.push(sidx, arr);
         }
       }
@@ -531,7 +561,7 @@ function plan(origin, dest, departSec, options = {}) {
       cur = p.from;
     } else {
       legs.push({ type: 'bus', trip: p.trip, boardStop: p.from, alightStop: cur,
-                  board: p.board, alight: p.alight });
+                  board: p.board, alight: p.alight, shift: p.shift || 0 });
       cur = p.from;
     }
   }
@@ -565,8 +595,9 @@ function plan(origin, dest, departSec, options = {}) {
       t = leg.end;
     } else {
       const ti = leg.trip;
-      leg.start = state.trips.start[ti] + state.st.arr[state.trips.offset[ti] + leg.board];
-      leg.end = state.trips.start[ti] + state.st.arr[state.trips.offset[ti] + leg.alight];
+      const sh = leg.shift || 0;                                  // frequency-run displacement
+      leg.start = state.trips.start[ti] + state.st.arr[state.trips.offset[ti] + leg.board] + sh;
+      leg.end = state.trips.start[ti] + state.st.arr[state.trips.offset[ti] + leg.alight] + sh;
       leg.routeIdx = state.trips.route[ti];
       leg.seconds = leg.end - leg.start;
       leg.stopCount = leg.alight - leg.board;
@@ -855,7 +886,7 @@ function maybeRedraw() {
  * same headsign and merges their departures at the kerb.
  */
 function nextDepartures(routeIdx, boardStop, headsignIdx, afterSec, count = 3, horizonSec = 5400) {
-  const active = activeServices(new Date());
+  const active = activeServices();
   const cands = [];
   const horizon = afterSec + horizonSec;      // "next bus" means within the next while,
   for (let pi = 0; pi < state.pat.n; pi++) {  // not the 17:09 departure while it is 10:39
@@ -893,11 +924,18 @@ function nextDepartures(routeIdx, boardStop, headsignIdx, afterSec, count = 3, h
  */
 function renderNextBuses(list, readyAt, legStart) {
   if (!list || !list.length) return '';
-  return list.slice(0, 3).map((d, i) => {
-    const wait = Math.max(0, Math.round((d.dep - readyAt) / 60));
-    const taken = legStart !== undefined && Math.abs(d.dep - legStart) <= 60 ? ' taken' : '';
+  const items = list.slice(0, 3).map((d) => d.dep);
+  // The plan can board a bus that sits beyond the merged-variant list; show it
+  // anyway so the ringed oval always exists and always means "the one you take".
+  if (legStart !== undefined && !items.some((dep) => Math.abs(dep - legStart) <= 60)) {
+    if (items.length >= 3) items[2] = legStart; else items.push(legStart);
+    items.sort((a, b) => a - b);
+  }
+  return items.map((dep, i) => {
+    const wait = Math.max(0, Math.round((dep - readyAt) / 60));
+    const taken = legStart !== undefined && Math.abs(dep - legStart) <= 60 ? ' taken' : '';
     const label = ['下一班', '第二班', '第三班'][i];
-    return `<i class="eta r${i + 1}${taken}" title="${label} · ${wait} 分鐘後（${hhmm(d.dep)}）">${wait}</i>`;
+    return `<i class="eta r${i + 1}${taken}" title="${label} · ${wait} 分鐘後（${hhmm(dep)}）">${wait}</i>`;
   }).join('');
 }
 
