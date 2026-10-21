@@ -59,6 +59,7 @@ async function boot() {
   ]);
   // route alignments are optional: without them the map falls back to straight lines
   state.shapes = await loadShapes();
+  state.walkShapes = await loadWalkShapes();
 
   // trips.bin: <4s II> then u16 route, u8 service, u32 start, u32 offset, u16 nstops, u16 headsign
   const nTrips = new DataView(tripsBuf).getUint32(4, true);
@@ -306,6 +307,49 @@ async function loadShapes() {
     console.warn('route shapes unavailable, drawing straight lines', e);
     return null;
   }
+}
+
+/**
+ * Walking geometry: the footpath polyline for every kerb pair within walking
+ * distance, built from the OSM pedestrian network (shapes/walk.bin).
+ * `KHW1` + u32 nPairs, u32 nPts, then pairA[n], pairB[n], pointOff[n+1],
+ * and interleaved int32 lat/lon at 1e7.
+ */
+async function loadWalkShapes() {
+  try {
+    const b = await (await fetch('shapes/walk.bin', { cache: 'no-cache' })).arrayBuffer();
+    const dv = new DataView(b);
+    const magic = String.fromCharCode(...new Uint8Array(b, 0, 4));
+    if (magic !== 'KHW1') throw new Error(`bad magic ${magic}`);
+    const nPairs = dv.getUint32(4, true), nPts = dv.getUint32(8, true);
+    let o = 12;
+    const pairA = u32(b, o, nPairs); o += nPairs * 4;
+    const pairB = u32(b, o, nPairs); o += nPairs * 4;
+    const off = u32(b, o, nPairs + 1); o += (nPairs + 1) * 4;
+    const pts = new Int32Array(b.slice(o, o + nPts * 8));
+    const index = new Map();
+    for (let i = 0; i < nPairs; i++) {
+      const a = Math.min(pairA[i], pairB[i]), c = Math.max(pairA[i], pairB[i]);
+      if (a >= state.stops.length || c >= state.stops.length) continue;
+      index.set(a * state.stops.length + c, i);
+    }
+    return { nPairs, nPts, off, pts, index };
+  } catch (e) {
+    console.warn('walk shapes unavailable, drawing straight lines', e);
+    return null;
+  }
+}
+
+function walkGeometry(a, c) {
+  const w = state.walkShapes;
+  if (!w) return null;
+  const lo = Math.min(a, c), hi = Math.max(a, c);
+  const i = w.index.get(lo * state.stops.length + hi);
+  if (i === undefined) return null;
+  const out = [];
+  for (let k = w.off[i]; k < w.off[i + 1]; k++) out.push([w.pts[k * 2] / 1e7, w.pts[k * 2 + 1] / 1e7]);
+  if (a > c) out.reverse();                     // keep the walking direction
+  return out.length > 1 ? out : null;
 }
 
 function legGeometry(pi, board, alight) {
@@ -574,7 +618,7 @@ function plan(origin, dest, departSec, options = {}) {
   // walk from the last stop to the actual destination point (added before the
   // merge so it collapses with an alighting walk into one leg)
   if (best.walk > 0) {
-    legs.push({ type: 'walk', metres: best.walk, toDest: true });
+    legs.push({ type: 'walk', metres: best.walk, toDest: true, from: best.stop });
   }
 
   // collapse chains of walking legs (a multi-hop walk is one walk to the rider)
@@ -700,11 +744,9 @@ function drawPlan(plan) {
       addLayer(L.circleMarker(a, { radius: 4, color: '#b4232b', fillColor: '#fff', fillOpacity: 1, weight: 2 }));
       pts.push(...line);
     } else if (leg.type === 'walk' && leg.metres > 25) {
-      const from = leg.from !== undefined ? state.stops[leg.from] : null;
-      const to = leg.to !== undefined ? state.stops[leg.to] : null;
-      if (from && to) {
-        addLayer(L.polyline([[from[1], from[2]], [to[1], to[2]]],
-          { color: '#6b6b70', weight: 3, dashArray: '5,6', opacity: .9 }));
+      const line = walkLine(leg);
+      if (line && line.length > 1) {
+        addLayer(L.polyline(line, { color: '#6b6b70', weight: 3, dashArray: '5,6', opacity: .9 }));
       }
     }
   }
@@ -714,6 +756,62 @@ function drawPlan(plan) {
     addLayer(L.marker([p.lat, p.lon], { icon: state.pointIcon('B', '#b4232b') }));
   }
   if (pts.length) state.map.fitBounds(pts, { padding: [40, 40] });
+}
+
+/**
+ * The polyline to draw for a walking leg.
+ *
+ * Stop→stop transfers use the precomputed footpath directly. Walks that start
+ * or end at an arbitrary picked place have no precomputed geometry, so they are
+ * drawn as: the point, a short hop to the nearest kerb, then that kerb's real
+ * footpath to the destination stop. If the detour is silly, fall back to a line.
+ */
+function walkLine(leg) {
+  const st = state.stops;
+  const fromStop = leg.from !== undefined ? leg.from : null;
+  const toStop = leg.to !== undefined ? leg.to : null;
+
+  if (fromStop !== null && toStop !== null) {
+    const geo = walkGeometry(fromStop, toStop);
+    if (geo) return geo;
+    return [[st[fromStop][1], st[fromStop][2]], [st[toStop][1], st[toStop][2]]];
+  }
+
+  const point = coordOf(leg.from === undefined ? state.from : state.to);
+  const stopIdx = fromStop !== null ? fromStop : toStop;
+  if (stopIdx === null || stopIdx === undefined) return null;
+  const target = [st[stopIdx][1], st[stopIdx][2]];
+  const toStopWalk = endWalkPath(point, stopIdx);
+  const line = toStopWalk || [[point.lat, point.lon], target];
+  // keep the drawn line in the same ballpark as the quoted metres
+  let length = 0;
+  for (let i = 1; i < line.length; i++) length += haversine(line[i - 1][0], line[i - 1][1], line[i][0], line[i][1]);
+  const ok = length <= Math.max(1.7 * Math.max(leg.metres, 60), leg.metres + 90);
+  const draw = ok ? line : [[point.lat, point.lon], target];
+  return leg.from === undefined ? draw : draw.slice().reverse();   // stop → place walks backwards
+}
+
+/**
+ * Footpath from an arbitrary point to a stop: snap the point to the nearest
+ * vertex of the footpaths that feed that stop, then follow that path in.
+ */
+function endWalkPath(point, stopIdx) {
+  const st = state.stops;
+  let best = null;
+  for (let k = state.walk.off[stopIdx]; k < state.walk.off[stopIdx + 1]; k++) {
+    const n = state.walk.pairs[k];
+    let geo = walkGeometry(n, stopIdx);
+    if (!geo) { geo = walkGeometry(stopIdx, n); if (geo) geo = geo.slice().reverse(); }
+    if (!geo) continue;
+    const end = geo[geo.length - 1];
+    if (haversine(end[0], end[1], st[stopIdx][1], st[stopIdx][2]) > 40) continue;  // not pointing at the kerb
+    for (let i = 0; i < geo.length; i++) {
+      const d = haversine(point.lat, point.lon, geo[i][0], geo[i][1]);
+      if (!best || d < best.dist) best = { geo, idx: i, dist: d };
+    }
+  }
+  if (!best || best.dist > 350) return null;
+  return [[point.lat, point.lon], ...best.geo.slice(best.idx)];
 }
 
 function coordOf(sel) {
