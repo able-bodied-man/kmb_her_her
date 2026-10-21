@@ -257,9 +257,20 @@ async function searchPlacesNominatim(q) {
 }
 
 /* ------------------------------------------------------------------- service */
-function activeServices(date) {
-  const bits = 1 << ((date.getDay() + 6) % 7);
-  const ymd = date.getFullYear() * 10000 + (date.getMonth() + 1) * 100 + date.getDate();
+/** Hong Kong wall-clock time, regardless of the browser's timezone. */
+function hkNow() {
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Asia/Hong_Kong', hour12: false,
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+  }).formatToParts(new Date());
+  const g = (t) => Number(parts.find((p) => p.type === t).value);
+  return new Date(Date.UTC(g('year'), g('month') - 1, g('day'), g('hour') % 24, g('minute'), g('second')));
+}
+
+function activeServices(date = hkNow()) {
+  const bits = 1 << ((date.getUTCDay() + 6) % 7);
+  const ymd = date.getUTCFullYear() * 10000 + (date.getUTCMonth() + 1) * 100 + date.getUTCDate();
   const set = new Set();
   for (const sid of Object.keys(state.cal.calendar)) {
     const [mask, start, end] = state.cal.calendar[sid];
@@ -949,10 +960,10 @@ function renderResult(plan, container, index) {
   return card;
 }
 
-/** Departure time is simply "when the user pressed 規劃路線". */
+/** Departure time is simply "when the user pressed 規劃路線", in Hong Kong time. */
 function nowSeconds() {
-  const d = new Date();
-  return d.getHours() * 3600 + d.getMinutes() * 60 + d.getSeconds();
+  const d = hkNow();
+  return d.getUTCHours() * 3600 + d.getUTCMinutes() * 60 + d.getUTCSeconds();
 }
 
 function planSignature(p) {
