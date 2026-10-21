@@ -180,10 +180,37 @@ button.ghost:hover { border-color: var(--red); color: var(--red); }
   align-items: baseline;
   gap: 10px;
   flex-wrap: wrap;
-  margin-bottom: 8px;
+  margin-bottom: 0;
+  cursor: pointer;
+  list-style: none;
 }
+.card details.itin > .legs { margin-top: 10px; }
+/* explicit: a closed card shows only its summary line */
+.card details.itin:not([open]) > .legs { display: none; }
+.card details.itin[open] .summary { margin-bottom: 2px; }
+.card .summary::-webkit-details-marker { display: none; }
+.card .summary::after {
+  content: "▾";
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 11px;
+  transition: transform .15s ease;
+  transform: rotate(-90deg);
+}
+.card details.itin[open] .summary::after { transform: rotate(0deg); }
 .card .total { font-size: 20px; font-weight: 700; }
 .card .times { color: var(--muted); font-size: 13.5px; }
+.card .chain { display: inline-flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+.card .chain b {
+  font-size: 12px;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 5px;
+  background: var(--red);
+  color: #fff;
+  letter-spacing: .2px;
+}
+.card .chain i { font-style: normal; color: var(--muted); font-size: 11px; }
 
 .legs { display: grid; gap: 8px; }
 .leg { display: grid; grid-template-columns: 78px 1fr; gap: 10px; align-items: baseline; }

@@ -18,6 +18,7 @@ const MAX_OFFSET_SLACK = 7200;   // guard for binary search over trip starts
 
 const state = {
   stops: [], routes: [], headsigns: [], cal: null, calIndex: {}, cards: [],
+  plans: [], sigs: [], lastDepart: 0,
   trips: null, st: null, walk: null, pat: null, sp: null,
   from: null, to: null,
   map: null, mapLayers: [],
@@ -1104,11 +1105,14 @@ function renderNextBuses(list, planDepart) {
 }
 
 function summaryHTML(plan) {
-  const transfers = plan.legs.filter(l => l.type === 'bus').length - 1;
+  const busLegs = plan.legs.filter(l => l.type === 'bus');
+  const transfers = busLegs.length - 1;
   const walkMetres = plan.legs.filter(l => l.type === 'walk').reduce((a, l) => a + l.metres, 0);
+  const chain = busLegs.map(l => `<b>${routeShort(l.routeIdx)}</b>`).join('<i>＞</i>') || '步行';
   return `
     <span class="total">${mins(plan.arrive - plan.depart)} 分鐘</span>
     <span class="times">${hhmm(plan.depart)} 出發 → ${hhmm(plan.arrive)} 抵達</span>
+    <span class="chain">${chain}</span>
     <span class="times">${transfers > 0 ? `轉乘 ${transfers} 次` : '直達'}${walkMetres >= 50 ? ` · 步行 ${walkMetres >= 1000 ? (walkMetres / 1000).toFixed(1) + ' 公里' : Math.round(walkMetres) + ' 米'}` : ''}</span>`;
 }
 
@@ -1162,24 +1166,34 @@ function stopListHTML(leg) {
 function renderResult(plan, container, index) {
   const card = document.createElement('article');
   card.className = 'card' + (index === 0 ? ' active' : '');
+  card.__plan = plan;
 
-  const head = document.createElement('div');
-  head.className = 'summary';
-  head.innerHTML = summaryHTML(plan);
-  card.appendChild(head);
+  // collapsed by default: the summary line is the whole card until expanded
+  const det = document.createElement('details');
+  det.className = 'itin';
+  const sum = document.createElement('summary');
+  sum.className = 'summary';
+  sum.innerHTML = summaryHTML(plan);
 
   const legs = document.createElement('div');
   legs.className = 'legs';
   legs.innerHTML = legsHTML(plan);
-  card.appendChild(legs);
 
-  card.addEventListener('click', (e) => {
-    if (e.target.closest('.stoplist')) return;          // toggling a stop list is not a card click
+  det.append(sum, legs);
+  card.appendChild(det);
+
+  det.addEventListener('toggle', () => {
+    if (!det.open) return;
     document.querySelectorAll('.card').forEach(c => c.classList.remove('active'));
     card.classList.add('active');
-    drawPlan(card.__plan || plan);
+    drawPlan(card.__plan);
   });
-  card.__plan = plan;
+  card.addEventListener('click', (e) => {
+    if (e.target.closest('.stoplist')) return;          // toggling a stop list is not a card click
+    if (!det.open) return;
+    drawPlan(card.__plan);
+  });
+
   container.appendChild(card);
   return card;
 }
@@ -1225,6 +1239,59 @@ function structureSig(p) {
 }
 
 /**
+ * Up to `limit` distinct journeys, best arrival first.
+ *
+ * The search returns one optimum, so alternatives are produced by re-running it
+ * with patterns banned: each round bans the first bus of the itinerary just
+ * found, which forces the next answer to start differently. Stops after the
+ * first hour of extra travel — a 3-hour detour is not an alternative, it is noise.
+ */
+function candidatePlans(origin, dest, departSec, limit = 10) {
+  const out = [];
+  const seen = new Set();
+  const banned = new Set();
+  let bestArrive = null;
+  for (let i = 0; i < limit + 5 && out.length < limit; i++) {
+    const p = plan(origin, dest, departSec, { bannedPat: banned });
+    if (!p) break;
+    const sig = structureSig(p);
+    if (!seen.has(sig)) {
+      seen.add(sig);
+      out.push(p);
+      if (bestArrive === null || p.arrive < bestArrive) bestArrive = p.arrive;
+    }
+    const buses = p.legs.filter(l => l.type === 'bus');
+    if (!buses.length) break;                     // walk-only answer: nothing to vary
+    const next = buses.find(l => !banned.has(l.pattern));
+    if (!next) break;                             // every pattern already excluded
+    banned.add(next.pattern);
+    if (bestArrive !== null && p.arrive > bestArrive + 3600) break;
+  }
+  out.sort((a, b) => a.arrive - b.arrive || a.depart - b.depart);
+  return out;
+}
+
+/**
+ * Move an itinerary's clock reference forward by `delta` seconds.
+ *
+ * Buses are absolute — they do not move because the page ticked — so only the
+ * walking legs and the departure/arrival bounds shift. Used by the 30 s ticker
+ * so the countdowns can refresh without re-running ten searches.
+ */
+function shiftPlan(p, delta) {
+  if (!delta) return p;
+  p.depart += delta;
+  for (const leg of p.legs) {
+    if (leg.type !== 'walk') continue;
+    leg.start += delta;
+    leg.end += delta;
+  }
+  const last = p.legs[p.legs.length - 1];
+  if (last) p.arrive = last.end;
+  return p;
+}
+
+/**
  * Re-plan the current origin/destination from *now*. When `auto` is set this is
  * the 30-second ticker: it only touches the DOM if the itinerary actually changed,
  * so a rider reading the results is not disturbed by a redraw every half minute.
@@ -1247,38 +1314,51 @@ function run(auto = false) {
   }
 
   const t0 = performance.now();
-  const first = plan(state.from, state.to, depart);
-  if (!first) {
+
+  // Ticker fast path: if the best journey is unchanged, shifting the clock is
+  // enough — no need to re-run ten searches every half minute.
+  if (auto && state.plans && state.plans.length && state.cards.length === state.plans.length) {
+    const probe = plan(state.from, state.to, depart);
+    if (probe && structureSig(probe) === state.sigs[0]) {
+      const delta = depart - state.lastDepart;
+      state.plans.forEach((p, i) => refreshCard(state.cards[i], shiftPlan(p, delta)));
+      state.lastDepart = depart;
+      setStatus(`以 ${hhmm(depart)} 出發計算，${state.plans.length} 條路線；${hhmm(depart + 30)} 再更新。`);
+      return;
+    }
+  }
+
+  const plans = candidatePlans(state.from, state.to, depart);
+  if (!plans.length) {
     if (auto) return;                       // keep the last good result on screen
     container.innerHTML = `<div class="empty">找不到只使用九巴／龍運及步行的路線。
       可能這個行程需要其他交通工具，或站點距離太遠。</div>`;
     setStatus('沒有結果。');
     return;
   }
-  const bus = first.legs.find(l => l.type === 'bus');
-  const alt = bus ? plan(state.from, state.to, depart, { bannedPat: new Set([bus.pattern]) }) : null;
-  const altOk = alt && alt.arrive > first.arrive ? alt : null;
+  const first = plans[0];
 
-  const sig = structureSig(first) + '#' + structureSig(altOk);
+  const sig = plans.map(structureSig).join('##');
   if (auto && sig === state.lastSignature) {
-    // Same journey, but the clock moved: refresh times and countdowns in place.
-    refreshCard(state.cards[0], first);
-    if (altOk && state.cards[1]) refreshCard(state.cards[1], altOk);
+    // Same journeys, but the clock moved: refresh times and countdowns in place.
+    plans.forEach((p, i) => refreshCard(state.cards[i], p));
     state.lastDepart = depart;
+    state.plans = plans;
     return;
   }
 
   container.innerHTML = '';
-  state.cards = [renderResult(first, container, 0)];
-  if (altOk) state.cards.push(renderResult(altOk, container, 1));
+  state.cards = plans.map((p, i) => renderResult(p, container, i));
   drawPlan(first);
   state.lastSignature = sig;
+  state.sigs = plans.map(structureSig);
+  state.plans = plans;
   state.lastDepart = depart;
 
   const ms = Math.round(performance.now() - t0);
-  setStatus(`以 ${hhmm(depart)} 出發計算，運算時間 ${ms} 毫秒` +
+  setStatus(`以 ${hhmm(depart)} 出發計算，找到 ${plans.length} 條路線，運算時間 ${ms} 毫秒` +
     (auto ? `；${hhmm(depart + 30)} 再更新。` : `；之後每 30 秒自動更新。`));
-  if (!auto) card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  if (!auto) state.cards[0].scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 }
 
 /** Every 30 s, refresh the answer against the current clock. */
