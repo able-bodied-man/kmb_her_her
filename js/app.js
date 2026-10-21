@@ -935,7 +935,7 @@ function renderNextBuses(list, readyAt, legStart) {
     const wait = Math.max(0, Math.round((dep - readyAt) / 60));
     const taken = legStart !== undefined && Math.abs(dep - legStart) <= 60 ? ' taken' : '';
     const label = ['下一班', '第二班', '第三班'][i];
-    return `<i class="eta r${i + 1}${taken}" title="${label} · ${wait} 分鐘後（${hhmm(dep)}）">${wait}</i>`;
+    return `<i class="eta r${i + 1}${taken}" title="${label} · ${wait} 分鐘後（${hhmm(dep)}）">${wait} 分</i>`;
   }).join('');
 }
 

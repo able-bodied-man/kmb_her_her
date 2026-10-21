@@ -210,9 +210,9 @@ button.ghost:hover { border-color: var(--red); color: var(--red); }
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-width: 24px;
-  height: 17px;
-  padding: 0 6px;
+  min-width: 32px;
+  height: 18px;
+  padding: 0 7px;
   margin-left: 4px;
   border-radius: 999px;
   border: 1px solid transparent;
