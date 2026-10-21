@@ -872,8 +872,7 @@ function nextDepartures(routeIdx, boardStop, headsignIdx, afterSec, count = 3, h
         if (!active.has(state.trips.service[ti])) continue;
         const row = state.trips.offset[ti] + pos;
         if (!(state.st.packed[row] & (1 << 13))) continue;      // cannot board here
-        const dep = state.trips.start[ti] + state.st.arr[row];
-        if (dep >= afterSec && dep <= horizon) cands.push({ trip: ti, dep });
+        for (const dep of depTimes(ti, pos, afterSec, horizon)) cands.push({ trip: ti, dep });
       }
     }
   }
@@ -888,20 +887,18 @@ function nextDepartures(routeIdx, boardStop, headsignIdx, afterSec, count = 3, h
 }
 
 /**
- * "1st / 2nd / 3rd bus arrives in N minutes" chips, coloured by how soon:
- * green comes within 5 min, amber within 15, grey later. The bus the plan
- * actually catches is marked so the numbers are readable at a glance.
+ * Ovals sitting right next to the direction: the 1st bus of this route that
+ * reaches this kerb is green, the 2nd amber, the 3rd grey, each carrying its
+ * countdown. The bus the plan actually catches is ringed.
  */
-function renderNextBuses(list, readyAt, takenTrip) {
+function renderNextBuses(list, readyAt, legStart) {
   if (!list || !list.length) return '';
-  const chips = list.map((d, i) => {
+  return list.slice(0, 3).map((d, i) => {
     const wait = Math.max(0, Math.round((d.dep - readyAt) / 60));
-    const cls = wait <= 5 ? 'soon' : wait <= 15 ? 'mid' : 'far';
-    const taken = d.trip === takenTrip ? ' taken' : '';
-    const label = ['下一班', '第二班', '第三班'][i] || `${i + 1}`;
-    return `<em class="buschip ${cls}${taken}" title="${label} ${hhmm(d.dep)}">${wait} 分</em>`;
+    const taken = legStart !== undefined && Math.abs(d.dep - legStart) <= 60 ? ' taken' : '';
+    const label = ['下一班', '第二班', '第三班'][i];
+    return `<i class="eta r${i + 1}${taken}" title="${label} · ${wait} 分鐘後（${hhmm(d.dep)}）">${wait}</i>`;
   }).join('');
-  return `<span class="buschips">${chips}</span>`;
 }
 
 function renderResult(plan, container, index) {
@@ -942,10 +939,9 @@ function renderResult(plan, container, index) {
       const next = nextDepartures(leg.routeIdx, leg.boardStop, leg.headsign, prevEnd - 30, 3);
       row.innerHTML = `
         <span class="when">${hhmm(leg.start)} – ${hhmm(leg.end)}</span>
-        <span class="what">${badge}${headsignText(leg.headsign)}
+        <span class="what">${badge}${headsignText(leg.headsign)}${renderNextBuses(next, prevEnd, leg.start)}
           <span class="stops"><br>${stopName(leg.boardStop)} 上車 · ${stopName(leg.alightStop)} 落車 ·
-          ${leg.stopCount} 個站 · ${mins(leg.seconds)} 分鐘</span>
-          ${renderNextBuses(next, prevEnd, leg.trip)}</span>`;
+          ${leg.stopCount} 個站 · ${mins(leg.seconds)} 分鐘</span></span>`;
     }
     legs.appendChild(row);
     prevEnd = leg.end;

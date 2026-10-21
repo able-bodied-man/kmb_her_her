@@ -205,33 +205,29 @@ button.ghost:hover { border-color: var(--red); color: var(--red); }
 .leg.wait .when { color: #b6a07a; }
 .leg .stops { color: var(--muted); font-size: 12.5px; }
 
-/* next arrivals: 下一班 / 第二班 / 第三班, coloured by how soon */
-.buschips {
+/* next arrivals, as ovals next to the direction: 1st green, 2nd amber, 3rd grey */
+.eta {
   display: inline-flex;
-  gap: 4px;
   align-items: center;
-  margin-top: 5px;
-  flex-wrap: wrap;
-}
-.buschips::before {
-  content: "班次";
-  font-size: 10.5px;
-  color: var(--muted);
-  margin-right: 1px;
-}
-.buschip {
-  font-style: normal;
-  font-size: 11.5px;
-  font-weight: 700;
-  padding: 1px 7px;
+  justify-content: center;
+  min-width: 24px;
+  height: 17px;
+  padding: 0 6px;
+  margin-left: 4px;
   border-radius: 999px;
   border: 1px solid transparent;
+  font-style: normal;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
   font-variant-numeric: tabular-nums;
+  vertical-align: 1px;
+  cursor: help;
 }
-.buschip.soon { background: #e5f6ea; color: #14713a; border-color: #b9e2c6; }
-.buschip.mid { background: #fff3df; color: #8f5c00; border-color: #efd6a8; }
-.buschip.far { background: #eeeef1; color: #5f5f66; border-color: #dadade; }
-.buschip.taken { border-width: 2px; border-color: currentColor; }
+.eta.r1 { background: #e5f6ea; color: #14713a; border-color: #b9e2c6; }
+.eta.r2 { background: #fff3df; color: #8f5c00; border-color: #efd6a8; }
+.eta.r3 { background: #eeeef1; color: #5f5f66; border-color: #dadade; }
+.eta.taken { box-shadow: inset 0 0 0 1.5px currentColor; }
 
 .empty {
   background: var(--card);
