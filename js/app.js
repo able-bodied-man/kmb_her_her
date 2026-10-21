@@ -1102,7 +1102,9 @@ function summaryHTML(plan) {
 function legsHTML(plan) {
   let html = '';
   let prevEnd = plan.depart;
+  let k = -1;
   for (const leg of plan.legs) {
+    k += 1;
     if (leg.type === 'walk' && leg.metres < 40) { prevEnd = leg.end; continue; }   // same-kerb shuffle
     const wait = leg.start - prevEnd;
     if (wait >= 180) {
@@ -1120,12 +1122,28 @@ function legsHTML(plan) {
       html += `<div class="leg bus">
         <span class="when">${hhmm(leg.start)} – ${hhmm(leg.end)}</span>
         <span class="what">${badge}${headsignText(leg.headsign)}${renderNextBuses(next, plan.depart)}
-          <span class="stops"><br>${stopName(leg.boardStop)} 上車 · ${stopName(leg.alightStop)} 落車 ·
-          ${leg.stopCount} 個站 · ${mins(leg.seconds)} 分鐘</span></span></div>`;
+          <details class="stoplist" data-k="${k}"><summary>${stopName(leg.boardStop)} 上車 ·
+          ${stopName(leg.alightStop)} 落車 · ${leg.stopCount} 個站 · ${mins(leg.seconds)} 分鐘</summary>
+          ${stopListHTML(leg)}</details></span></div>`;
     }
     prevEnd = leg.end;
   }
   return html;
+}
+
+/** Every stop the bus calls at between boarding and alighting, with its time. */
+function stopListHTML(leg) {
+  const base = state.pat.stopOff[leg.pattern];
+  const shift = leg.shift || 0;
+  const rows = [];
+  for (let p = leg.board; p <= leg.alight; p++) {
+    const sidx = state.pat.stops[base + p];
+    const row = state.trips.offset[leg.trip] + p;
+    const t = state.trips.start[leg.trip] + state.st.arr[row] + shift;
+    const tag = p === leg.board ? '<em>上車</em>' : p === leg.alight ? '<em>落車</em>' : '';
+    rows.push(`<li${tag ? ' class="end"' : ''}><span class="t">${hhmm(t)}</span>${stopName(sidx)}${tag}</li>`);
+  }
+  return `<ol class="stoprows">${rows.join('')}</ol>`;
 }
 
 function renderResult(plan, container, index) {
@@ -1142,7 +1160,8 @@ function renderResult(plan, container, index) {
   legs.innerHTML = legsHTML(plan);
   card.appendChild(legs);
 
-  card.addEventListener('click', () => {
+  card.addEventListener('click', (e) => {
+    if (e.target.closest('.stoplist')) return;          // toggling a stop list is not a card click
     document.querySelectorAll('.card').forEach(c => c.classList.remove('active'));
     card.classList.add('active');
     drawPlan(card.__plan || plan);
@@ -1163,7 +1182,15 @@ function refreshCard(card, plan) {
   const head = card.querySelector('.summary');
   if (head) head.innerHTML = summaryHTML(plan);
   const legs = card.querySelector('.legs');
-  if (legs) legs.innerHTML = legsHTML(plan);
+  if (legs) {
+    // a rider may have a stop list open; keep it open across the 30 s redraw
+    const open = new Set([...legs.querySelectorAll('details.stoplist[open]')].map(d => d.dataset.k));
+    legs.innerHTML = legsHTML(plan);
+    for (const k of open) {
+      const d = legs.querySelector(`details.stoplist[data-k="${k}"]`);
+      if (d) d.open = true;
+    }
+  }
 }
 
 /** Departure time is simply "when the user pressed 規劃路線", in Hong Kong time. */
