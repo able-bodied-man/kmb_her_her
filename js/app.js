@@ -636,6 +636,10 @@ function setupField(which) {
   const input = document.getElementById(`${which}-input`);
   const list = document.getElementById(`${which}-suggest`);
   const picked = document.getElementById(`${which}-picked`);
+  if (!input || !list || !picked) {
+    console.warn(`field ${which} missing from the page; skipping wiring`);
+    return { setPoint() {} };
+  }
   let items = [], cursor = -1, placeSeq = 0, timer = null;
 
   const render = () => {
@@ -912,19 +916,31 @@ function autoRefresh() {
 }
 
 window.addEventListener('DOMContentLoaded', () => {
-  fieldFrom = setupField('from');
-  fieldTo = setupField('to');
-  const geoBtn = document.getElementById('from-geo');
-  if (geoBtn) geoBtn.addEventListener('click', locate);
-  document.getElementById('go').addEventListener('click', () => run(false));
-  document.getElementById('go').disabled = true;
-  setInterval(() => checkForUpdate(false), DATA_POLL_MS);
-  setInterval(autoRefresh, AUTO_REFRESH_MS);
-  document.addEventListener('visibilitychange', () => {
-    if (document.hidden) return;
-    checkForUpdate(false);
-    autoRefresh();
-  });
+  // A stale cached HTML/JS pair must never leave the page without a map: wire the
+  // controls defensively, then load the data no matter what happened above.
+  try {
+    fieldFrom = setupField('from');
+    fieldTo = setupField('to');
+    const geoBtn = document.getElementById('from-geo');
+    if (geoBtn) geoBtn.addEventListener('click', locate);
+    const go = document.getElementById('go');
+    if (go) {
+      go.addEventListener('click', () => run(false));
+      go.disabled = true;
+    }
+    const nowBtn = document.getElementById('now-btn');
+    if (nowBtn) nowBtn.addEventListener('click', () => run(false));
+    setInterval(() => checkForUpdate(false), DATA_POLL_MS);
+    setInterval(autoRefresh, AUTO_REFRESH_MS);
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) return;
+      checkForUpdate(false);
+      autoRefresh();
+    });
+  } catch (err) {
+    console.error('UI wiring failed', err);
+    setStatus(`介面初始化出錯：${err.message}（請按 Ctrl+Shift+R 重新載入）`);
+  }
   // handle for debugging / tests (no effect on the UI)
   window.__khh = { state, plan, searchStops, searchPlaces, hhmm, stopName, routeShort,
                    headsignText, run, autoRefresh, stopsNear, checkForUpdate, boot };

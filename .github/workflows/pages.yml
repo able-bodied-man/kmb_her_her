@@ -44,6 +44,15 @@ jobs:
           python pipeline/verify.py 1
       - name: Setup Pages
         uses: actions/configure-pages@v5
+      - name: Stamp asset version
+        # cache-bust css/js per deploy so a stale cached script can never be paired
+        # with fresh HTML (that pairing kills the map: the old script looks for
+        # controls the new page no longer has)
+        run: |
+          v="${GITHUB_SHA::8}"
+          sed -i "s/__ASSET_V__/${v}/g" index.html
+          grep -o 'app\.js?v=[a-z0-9]*' index.html
+          grep -o 'style\.css?v=[a-z0-9]*' index.html
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
