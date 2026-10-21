@@ -1243,25 +1243,32 @@ function structureSig(p) {
  *
  * The search returns one optimum, so alternatives are produced by re-running it
  * with patterns banned: each round bans the first bus of the itinerary just
- * found, which forces the next answer to start differently. Stops after the
- * first hour of extra travel — a 3-hour detour is not an alternative, it is noise.
+ * found, which forces the next answer to start differently. Itineraries with more
+ * than three rides (two changes) are dropped — past that the answer stops being a
+ * journey a passholder would actually make — and anything more than an hour worse
+ * than the best is treated as noise.
  */
-function candidatePlans(origin, dest, departSec, limit = 10) {
+const MAX_RIDES = 3;
+
+function candidatePlans(origin, dest, departSec, limit = 5) {
   const out = [];
   const seen = new Set();
   const banned = new Set();
   let bestArrive = null;
-  for (let i = 0; i < limit + 5 && out.length < limit; i++) {
+  for (let i = 0; i < limit + 12 && out.length < limit; i++) {
     const p = plan(origin, dest, departSec, { bannedPat: banned });
     if (!p) break;
-    const sig = structureSig(p);
-    if (!seen.has(sig)) {
-      seen.add(sig);
-      out.push(p);
-      if (bestArrive === null || p.arrive < bestArrive) bestArrive = p.arrive;
-    }
     const buses = p.legs.filter(l => l.type === 'bus');
-    if (!buses.length) break;                     // walk-only answer: nothing to vary
+    const rides = buses.length;
+    if (rides <= MAX_RIDES) {
+      const sig = structureSig(p);
+      if (!seen.has(sig)) {
+        seen.add(sig);
+        out.push(p);
+        if (bestArrive === null || p.arrive < bestArrive) bestArrive = p.arrive;
+      }
+    }
+    if (!rides) break;                            // walk-only answer: nothing to vary
     const next = buses.find(l => !banned.has(l.pattern));
     if (!next) break;                             // every pattern already excluded
     banned.add(next.pattern);
@@ -1328,13 +1335,20 @@ function run(auto = false) {
     }
   }
 
-  const plans = candidatePlans(state.from, state.to, depart);
+  let plans = candidatePlans(state.from, state.to, depart);
+  let onlyOverLimit = false;
   if (!plans.length) {
-    if (auto) return;                       // keep the last good result on screen
-    container.innerHTML = `<div class="empty">找不到只使用九巴／龍運及步行的路線。
-      可能這個行程需要其他交通工具，或站點距離太遠。</div>`;
-    setStatus('沒有結果。');
-    return;
+    // every option needs more than two changes: show the best one rather than nothing
+    const only = plan(state.from, state.to, depart);
+    if (!only) {
+      if (auto) return;                     // keep the last good result on screen
+      container.innerHTML = `<div class="empty">找不到只使用九巴／龍運及步行的路線。
+        可能這個行程需要其他交通工具，或站點距離太遠。</div>`;
+      setStatus('沒有結果。');
+      return;
+    }
+    plans = [only];
+    onlyOverLimit = true;
   }
   const first = plans[0];
 
@@ -1356,8 +1370,9 @@ function run(auto = false) {
   state.lastDepart = depart;
 
   const ms = Math.round(performance.now() - t0);
-  setStatus(`以 ${hhmm(depart)} 出發計算，找到 ${plans.length} 條路線，運算時間 ${ms} 毫秒` +
-    (auto ? `；${hhmm(depart + 30)} 再更新。` : `；之後每 30 秒自動更新。`));
+  setStatus(`以 ${hhmm(depart)} 出發計算，找到 ${plans.length} 條路線` +
+    (onlyOverLimit ? '（其餘方案需超過 2 次轉乘，已略去）' : '') +
+    `，運算時間 ${ms} 毫秒` + (auto ? `；${hhmm(depart + 30)} 再更新。` : `；之後每 30 秒自動更新。`));
   if (!auto) state.cards[0].scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 }
 
