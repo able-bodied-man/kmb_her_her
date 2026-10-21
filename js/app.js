@@ -445,7 +445,11 @@ function findTrip(pi, pos, after, active) {
   }
   if (ans < 0) return null;
   let best = null, scanned = 0;
-  for (let k = ans; k < to && scanned < 80; k++, scanned++) {
+  // Scan *backwards* as well as forwards: a trip carrying a frequency window runs
+  // long after its template start (a 09:35 trip may still be departing at 15:35),
+  // so the template the binary search lands on is often not the earliest *run*.
+  const fromK = Math.max(from, ans - 80);
+  for (let k = fromK; k < to && scanned < 220; k++, scanned++) {
     const ti = list[k];
     if (start[ti] > after + 6 * 3600) break;
     if (!active.has(service[ti])) continue;
