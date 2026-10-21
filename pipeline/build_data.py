@@ -42,7 +42,7 @@ import struct
 import sys
 import urllib.request
 from array import array
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 FEED_BASE = "https://static.data.gov.hk/td/pt-headway-en"
 FEED_FILES = [
@@ -591,7 +591,7 @@ def main() -> int:
                   f, separators=(",", ":"))
 
     meta = {
-        "generated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "generated": datetime.now(timezone(timedelta(hours=8))).isoformat(timespec="seconds"),
         "digest": data_digest(OUT),
         "feed": FEED_BASE,
         "agencies": [{"id": a, "name": agencies.get(a, a)} for a in sorted(ALLOWED_AGENCIES)],

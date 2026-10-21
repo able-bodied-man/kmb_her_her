@@ -24,6 +24,7 @@ import os
 import pickle
 import struct
 import time
+from datetime import datetime, timedelta, timezone
 from array import array
 
 import osmium
@@ -319,7 +320,7 @@ def main():
         f"{os.path.getsize(os.path.join(OUT, 'walk.bin')) / 1e6:.2f} MB, {time.time() - t0:.0f}s")
     json.dump({"pairs": len(pairs), "vertices": vertices, "routed": routed,
                "unroutable": unroutable, "too_long": straight,
-               "simplify_m": SIMPLIFY_M, "built": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())},
+               "simplify_m": SIMPLIFY_M, "built": datetime.now(timezone(timedelta(hours=8))).isoformat(timespec="seconds")},
               open(os.path.join(OUT, "walk_meta.json"), "w"), indent=1)
 
 

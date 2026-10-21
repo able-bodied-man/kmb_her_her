@@ -16,6 +16,13 @@ permissions:
   pages: write
   id-token: write
 
+# Everything in this project speaks Hong Kong time (UTC+8): the feed's timetable,
+# the dataset's `generated` stamp and every page render. The runner's own clock is
+# UTC, so pin the timezone for the build too. (Note: `schedule: cron` below is
+# interpreted by GitHub in UTC — */30 is unaffected because Hong Kong has no DST.)
+env:
+  TZ: Asia/Hong_Kong
+
 concurrency:
   group: "pages"
   cancel-in-progress: false

@@ -153,14 +153,14 @@ async function checkForUpdate(manual = false) {
     const meta = await r.json();
     const same = meta.digest ? meta.digest === state.digest : meta.generated === state.generated;
     if (!meta.generated || same) {
-      if (manual) setStatus(`資料已是最新（${state.generated || '未知'} UTC 版本）。`);
+      if (manual) setStatus(`資料已是最新（${hkStamp(state.generated)} 香港時間版本）。`);
       return;
     }
     refreshing = true;
     const hadQuery = state.lastQuery;
     await boot();
     if (hadQuery && state.from && state.to) run(true);
-    setStatus(`資料已更新至 ${meta.generated} UTC 版本（班次 ${meta.counts.trips} 班）。`);
+    setStatus(`資料已更新至 ${hkStamp(meta.generated)} 香港時間版本（班次 ${meta.counts.trips} 班）。`);
   } catch (e) {
     console.warn('update check failed', e);
   } finally {
@@ -258,6 +258,19 @@ async function searchPlacesNominatim(q) {
 }
 
 /* ------------------------------------------------------------------- service */
+/** A dataset timestamp (ISO 8601) rendered as Hong Kong wall clock, MM-DD HH:MM. */
+function hkStamp(iso) {
+  if (!iso) return '未知';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return String(iso);
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Asia/Hong_Kong', hour12: false,
+    month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit',
+  }).formatToParts(d);
+  const g = (t) => (parts.find((p) => p.type === t) || {}).value;
+  return `${g('month')}-${g('day')} ${g('hour')}:${g('minute')}`;
+}
+
 /** Hong Kong wall-clock time, regardless of the browser's timezone. */
 function hkNow() {
   const parts = new Intl.DateTimeFormat('en-GB', {
