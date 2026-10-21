@@ -119,10 +119,11 @@ async function boot() {
  * query in place — no page refresh, no lost selection.
  */
 const DATA_POLL_MS = 3 * 60 * 1000;
+const AUTO_REFRESH_MS = 30 * 1000;          // re-plan against the current clock
 let refreshing = false;
 
-function rememberQuery() {
-  state.lastQuery = { from: state.from, to: state.to, depart: timeFromInput() };
+function rememberQuery(depart) {
+  state.lastQuery = { from: state.from, to: state.to, depart };
 }
 
 async function checkForUpdate(manual = false) {
@@ -139,10 +140,7 @@ async function checkForUpdate(manual = false) {
     refreshing = true;
     const hadQuery = state.lastQuery;
     await boot();
-    if (hadQuery && state.from && state.to) {
-      document.getElementById('time-input').value = hhmm(hadQuery.depart);
-      run();
-    }
+    if (hadQuery && state.from && state.to) run(true);
     setStatus(`資料已更新至 ${meta.generated} UTC 版本（班次 ${meta.counts.trips} 班）。`);
   } catch (e) {
     console.warn('update check failed', e);
@@ -785,16 +783,6 @@ function maybeRedraw() {
   go.disabled = !(state.from && state.to);
 }
 
-function timeFromInput() {
-  const v = document.getElementById('time-input').value || hhmmNow();
-  const [h, m] = v.split(':').map(Number);
-  return h * 3600 + m * 60;
-}
-function hhmmNow() {
-  const d = new Date();
-  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
-}
-
 function renderResult(plan, container, index) {
   const card = document.createElement('article');
   card.className = 'card' + (index === 0 ? ' active' : '');
@@ -849,15 +837,34 @@ function renderResult(plan, container, index) {
   return card;
 }
 
-function run() {
+/** Departure time is simply "when the user pressed 規劃路線". */
+function nowSeconds() {
+  const d = new Date();
+  return d.getHours() * 3600 + d.getMinutes() * 60 + d.getSeconds();
+}
+
+function planSignature(p) {
+  if (!p) return 'null';
+  return p.arrive + '|' + p.legs.map(l => l.type === 'bus'
+    ? `b${l.trip}:${l.board}:${l.alight}`
+    : `w${Math.round(l.metres)}`).join(',');
+}
+
+/**
+ * Re-plan the current origin/destination from *now*. When `auto` is set this is
+ * the 30-second ticker: it only touches the DOM if the itinerary actually changed,
+ * so a rider reading the results is not disturbed by a redraw every half minute.
+ */
+function run(auto = false) {
+  if (!state.from || !state.to) return;
   const container = document.getElementById('results');
-  container.innerHTML = '';
-  const depart = timeFromInput();
-  rememberQuery();
+  const depart = nowSeconds();
+  rememberQuery(depart);
 
   // a coordinate origin/destination only works if a stop is walkable from it
   for (const [sel, name] of [[state.from, '起點'], [state.to, '終點']]) {
     if (sel && sel.stop === undefined && stopsNear(sel.lat, sel.lon, ORIGIN_WALK_M).length === 0) {
+      if (auto) return;
       container.innerHTML = `<div class="empty">${name} ${ORIGIN_WALK_M} 米範圍內沒有九巴／龍運車站，
         這個位置無法只用九巴／龍運及步行到達。</div>`;
       setStatus('沒有結果。');
@@ -868,43 +875,59 @@ function run() {
   const t0 = performance.now();
   const first = plan(state.from, state.to, depart);
   if (!first) {
+    if (auto) return;                       // keep the last good result on screen
     container.innerHTML = `<div class="empty">找不到只使用九巴／龍運及步行的路線。
       可能這個行程需要其他交通工具，或站點距離太遠。</div>`;
     setStatus('沒有結果。');
     return;
   }
-  const card = renderResult(first, container, 0);
-  drawPlan(first);
-
-  // one alternative: forbid the first bus pattern
   const bus = first.legs.find(l => l.type === 'bus');
-  if (bus) {
-    const alt = plan(state.from, state.to, depart, { bannedPat: new Set([bus.pattern]) });
-    if (alt && alt.arrive > first.arrive) renderResult(alt, container, 1);
+  const alt = bus ? plan(state.from, state.to, depart, { bannedPat: new Set([bus.pattern]) }) : null;
+  const altOk = alt && alt.arrive > first.arrive ? alt : null;
+
+  const sig = planSignature(first) + '#' + planSignature(altOk);
+  if (auto && sig === state.lastSignature) {
+    state.lastDepart = depart;              // nothing changed, stay quiet
+    return;
   }
+
+  container.innerHTML = '';
+  const card = renderResult(first, container, 0);
+  if (altOk) renderResult(altOk, container, 1);
+  drawPlan(first);
+  state.lastSignature = sig;
+  state.lastDepart = depart;
+
   const ms = Math.round(performance.now() - t0);
-  setStatus(`以 ${hhmm(depart)} 出發計算，運算時間 ${ms} 毫秒。`);
-  card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  setStatus(`以 ${hhmm(depart)} 出發計算，運算時間 ${ms} 毫秒` +
+    (auto ? `；${hhmm(depart + 30)} 再更新。` : `；之後每 30 秒自動更新。`));
+  if (!auto) card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+/** Every 30 s, refresh the answer against the current clock. */
+function autoRefresh() {
+  if (document.hidden) return;
+  if (!state.lastSignature) return;         // no query has been run yet
+  run(true);
 }
 
 window.addEventListener('DOMContentLoaded', () => {
   fieldFrom = setupField('from');
   fieldTo = setupField('to');
-  document.getElementById('now-btn').addEventListener('click', () => {
-    document.getElementById('time-input').value = hhmmNow();
-  });
   const geoBtn = document.getElementById('from-geo');
   if (geoBtn) geoBtn.addEventListener('click', locate);
-  document.getElementById('time-input').value = hhmmNow();
-  document.getElementById('go').addEventListener('click', run);
+  document.getElementById('go').addEventListener('click', () => run(false));
   document.getElementById('go').disabled = true;
-  const refreshBtn = document.getElementById('data-refresh');
-  if (refreshBtn) refreshBtn.addEventListener('click', () => checkForUpdate(true));
   setInterval(() => checkForUpdate(false), DATA_POLL_MS);
-  document.addEventListener('visibilitychange', () => { if (!document.hidden) checkForUpdate(false); });
+  setInterval(autoRefresh, AUTO_REFRESH_MS);
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) return;
+    checkForUpdate(false);
+    autoRefresh();
+  });
   // handle for debugging / tests (no effect on the UI)
   window.__khh = { state, plan, searchStops, searchPlaces, hhmm, stopName, routeShort,
-                   headsignText, run, stopsNear, checkForUpdate, boot };
+                   headsignText, run, autoRefresh, stopsNear, checkForUpdate, boot };
   boot().catch(err => {
     console.error(err);
     setStatus(`載入失敗：${err.message}`);
