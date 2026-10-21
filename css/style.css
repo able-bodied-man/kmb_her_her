@@ -205,6 +205,34 @@ button.ghost:hover { border-color: var(--red); color: var(--red); }
 .leg.wait .when { color: #b6a07a; }
 .leg .stops { color: var(--muted); font-size: 12.5px; }
 
+/* next arrivals: 下一班 / 第二班 / 第三班, coloured by how soon */
+.buschips {
+  display: inline-flex;
+  gap: 4px;
+  align-items: center;
+  margin-top: 5px;
+  flex-wrap: wrap;
+}
+.buschips::before {
+  content: "班次";
+  font-size: 10.5px;
+  color: var(--muted);
+  margin-right: 1px;
+}
+.buschip {
+  font-style: normal;
+  font-size: 11.5px;
+  font-weight: 700;
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  font-variant-numeric: tabular-nums;
+}
+.buschip.soon { background: #e5f6ea; color: #14713a; border-color: #b9e2c6; }
+.buschip.mid { background: #fff3df; color: #8f5c00; border-color: #efd6a8; }
+.buschip.far { background: #eeeef1; color: #5f5f66; border-color: #dadade; }
+.buschip.taken { border-width: 2px; border-color: currentColor; }
+
 .empty {
   background: var(--card);
   border-radius: 14px;

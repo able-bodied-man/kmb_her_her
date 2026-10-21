@@ -432,12 +432,14 @@ def main() -> int:
 
     st_stop, st_arr = array("H"), array("H")
     trip_stop_lists: list[tuple[int, ...]] = []
+    trip_index_by_id: dict[str, int] = {}
 
     n_stopts = 0
     for trip in trips:
         arr = stop_times.get(trip["trip_id"])
         if not arr:
             continue
+        trip_index_by_id[trip["trip_id"]] = len(t_route)
         arr.sort(key=lambda x: x[0])
         start = arr[0][1]
         t_route.append(route_index[trip["route_id"]])
@@ -466,6 +468,31 @@ def main() -> int:
     with open(os.path.join(OUT, "stoptimes.bin"), "wb") as f:
         f.write(struct.pack("<4sI", b"KHT2", n_stopts))
         st_stop.tofile(f); st_arr.tofile(f)
+
+    # ------------------------------------------------------------- frequencies
+    # The feed models frequent service as a template trip plus a window:
+    # "this trip every 540 s between 07:12 and 07:39". Expanding those into real
+    # trips would multiply the stop_times by ~5, so the windows are shipped as a
+    # small table and expanded at query time by the router and the arrival chips.
+    log("      packing frequency windows")
+    fr_rows: list[tuple[int, int, int, int]] = []
+    for row in rows("frequencies.txt"):
+        ti = trip_index_by_id.get(row["trip_id"])
+        if ti is None:
+            continue
+        fr_rows.append((ti, gtfs_secs(row["start_time"]), gtfs_secs(row["end_time"]),
+                        max(30, int(row["headway_secs"]))))
+    fr_rows.sort()
+    fr_trip = array("I", [r[0] for r in fr_rows])
+    fr_start = array("I", [r[1] for r in fr_rows])
+    fr_end = array("I", [r[2] for r in fr_rows])
+    fr_head = array("H", [min(65535, r[3]) for r in fr_rows])
+    with open(os.path.join(OUT, "frequencies.bin"), "wb") as f:
+        f.write(struct.pack("<4sI", b"KHF1", len(fr_rows)))
+        fr_trip.tofile(f); fr_start.tofile(f); fr_end.tofile(f); fr_head.tofile(f)
+    n_fr_trips = len({r[0] for r in fr_rows})
+    log(f"      {len(fr_rows)} frequency windows over {n_fr_trips} trips "
+        f"({100 * n_fr_trips / max(1, len(t_route)):.1f}% of trips)")
 
     # ---------------------------------------------------------------- patterns
     # Every distinct (route, ordered stop sequence) is a pattern; its trips are
@@ -574,7 +601,9 @@ def main() -> int:
                    "stops_with_chinese_name": sum(1 for s in stop_list if len(s) > 4 and s[4]),
                    "trips_with_headsign": sum(1 for h in t_headsign if h != 0xFFFF),
                    "headsign_reaches_terminus": headsign_end_ok,
-                   "trips_duration_stretched": scaled},
+                   "trips_duration_stretched": scaled,
+                   "frequency_windows": len(fr_rows),
+                   "trips_with_frequencies": n_fr_trips},
         "names_source": "data.etabus.gov.hk (KMB/LWB open data API), matched by coordinate",
         "walk_radius_m": WALK_RADIUS_M,
         "bounds": [min(lats), min(lons), max(lats), max(lons)],

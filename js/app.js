@@ -53,9 +53,9 @@ async function boot() {
   state.digest = meta.digest || null;
   cal.services.forEach((sid, i) => { state.calIndex[sid] = i; });
 
-  const [tripsBuf, stBuf, walkBuf, patBuf, spBuf] = await Promise.all([
+  const [tripsBuf, stBuf, walkBuf, patBuf, spBuf, frBuf] = await Promise.all([
     getBuffer('trips.bin'), getBuffer('stoptimes.bin'), getBuffer('walk.bin'),
-    getBuffer('patterns.bin'), getBuffer('stoppatterns.bin'),
+    getBuffer('patterns.bin'), getBuffer('stoppatterns.bin'), getBuffer('frequencies.bin'),
   ]);
   // route alignments are optional: without them the map falls back to straight lines
   state.shapes = await loadShapes();
@@ -106,6 +106,24 @@ async function boot() {
   const dvsp = new DataView(spBuf);
   const spStops = dvsp.getUint32(4, true), spInc = dvsp.getUint32(8, true);
   state.sp = { off: u32(spBuf, 12, spStops + 1), pair: u32(spBuf, 12 + (spStops + 1) * 4, spInc) };
+
+  // frequencies.bin: <4s I> then u32 trip, u32 start, u32 end, u16 headway
+  const dvf = new DataView(frBuf);
+  const nFr = dvf.getUint32(4, true);
+  let fo = 8;
+  const frTrip = u32(frBuf, fo, nFr); fo += nFr * 4;
+  const frStart = u32(frBuf, fo, nFr); fo += nFr * 4;
+  const frEnd = u32(frBuf, fo, nFr); fo += nFr * 4;
+  const frHead = u16(frBuf, fo, nFr);
+  const freq = new Map();
+  for (let i = 0; i < nFr; i++) {
+    const t = frTrip[i];
+    let list = freq.get(t);
+    if (!list) { list = []; freq.set(t, list); }
+    list.push([frStart[i], frEnd[i], frHead[i]]);
+  }
+  state.freq = freq;
+  if (nFr) console.info(`frequency windows: ${nFr} over ${freq.size} trips`);
 
   buildSearchIndex();
   if (!state.map) initMap();
@@ -295,6 +313,35 @@ function legGeometry(pi, board, alight) {
 
 /* ------------------------------------------------------------------ geometry */
 const R = 6371000;
+
+/**
+ * Every departure time of trip `ti` from stop-position `pos` inside [after, horizon].
+ *
+ * A trip normally departs once. A trip listed in frequencies.bin runs repeatedly
+ * (a template trip plus a window: "every 540 s between 07:12 and 07:39"), so the
+ * window is expanded here instead of materialising ~5x more trips in the dataset.
+ */
+function depTimes(ti, pos, after, horizon) {
+  const row = state.trips.offset[ti] + pos;
+  const base = state.trips.start[ti] + state.st.arr[row];
+  const windows = state.freq && state.freq.get(ti);
+  if (!windows) return base >= after && base <= horizon ? [base] : [];
+  const shift = base - state.trips.start[ti];          // travel time to this stop
+  const out = [];
+  for (const [ws, we, h] of windows) {
+    let k = Math.max(0, Math.ceil((after - ws - shift) / h));
+    for (;;) {
+      const dep = ws + k * h + shift;
+      if (ws + k * h > we || dep > horizon) break;
+      if (dep >= after) out.push(dep);
+      k += 1;
+    }
+    if (out.length > 40) break;                        // plenty for any query
+  }
+  if (base >= after && base <= horizon && !out.includes(base)) out.push(base);
+  return out.sort((a, b) => a - b);
+}
+
 function haversine(aLat, aLon, bLat, bLon) {
   const p1 = aLat * Math.PI / 180, p2 = bLat * Math.PI / 180;
   const dp = p2 - p1, dl = (bLon - aLon) * Math.PI / 180;
@@ -787,6 +834,65 @@ function maybeRedraw() {
   go.disabled = !(state.from && state.to);
 }
 
+/**
+ * The next `count` departures of a *route* at a boarding stop, from the timetable.
+ *
+ * Trips are grouped into patterns by exact stop sequence, so one route can be
+ * split across several patterns (a variant that skips a stop, a short working).
+ * Asking only the pattern the plan used reports a 100-minute wait on a route that
+ * runs every 15 minutes, so this walks every pattern of the same route and the
+ * same headsign and merges their departures at the kerb.
+ */
+function nextDepartures(routeIdx, boardStop, headsignIdx, afterSec, count = 3, horizonSec = 5400) {
+  const active = activeServices(new Date());
+  const cands = [];
+  const horizon = afterSec + horizonSec;      // "next bus" means within the next while,
+  for (let pi = 0; pi < state.pat.n; pi++) {  // not the 17:09 departure while it is 10:39
+    if (state.pat.route[pi] !== routeIdx) continue;
+    const firstTrip = state.pat.trips[state.pat.tripOff[pi]];
+    if (headsignIdx !== undefined && headsignIdx !== 0xFFFF
+        && state.trips.headsign[firstTrip] !== headsignIdx) continue;
+    const base = state.pat.stopOff[pi];
+    for (let p = base; p < state.pat.stopOff[pi + 1]; p++) {
+      if (state.pat.stops[p] !== boardStop) continue;
+      const pos = p - base;
+      for (let k = state.pat.tripOff[pi]; k < state.pat.tripOff[pi + 1]; k++) {
+        const ti = state.pat.trips[k];
+        if (!active.has(state.trips.service[ti])) continue;
+        const row = state.trips.offset[ti] + pos;
+        if (!(state.st.packed[row] & (1 << 13))) continue;      // cannot board here
+        const dep = state.trips.start[ti] + state.st.arr[row];
+        if (dep >= afterSec && dep <= horizon) cands.push({ trip: ti, dep });
+      }
+    }
+  }
+  cands.sort((a, b) => a.dep - b.dep);
+  const out = [];
+  for (const c of cands) {
+    if (out.length && c.dep - out[out.length - 1].dep < 60) continue;   // same bus, other variant
+    out.push(c);
+    if (out.length >= count) break;
+  }
+  return out;
+}
+
+/**
+ * "1st / 2nd / 3rd bus arrives in N minutes" chips, coloured by how soon:
+ * green comes within 5 min, amber within 15, grey later. The bus the plan
+ * actually catches is marked so the numbers are readable at a glance.
+ */
+function renderNextBuses(list, readyAt, takenTrip) {
+  if (!list || !list.length) return '';
+  const chips = list.map((d, i) => {
+    const wait = Math.max(0, Math.round((d.dep - readyAt) / 60));
+    const cls = wait <= 5 ? 'soon' : wait <= 15 ? 'mid' : 'far';
+    const taken = d.trip === takenTrip ? ' taken' : '';
+    const label = ['下一班', '第二班', '第三班'][i] || `${i + 1}`;
+    return `<em class="buschip ${cls}${taken}" title="${label} ${hhmm(d.dep)}">${wait} 分</em>`;
+  }).join('');
+  return `<span class="buschips">${chips}</span>`;
+}
+
 function renderResult(plan, container, index) {
   const card = document.createElement('article');
   card.className = 'card' + (index === 0 ? ' active' : '');
@@ -822,11 +928,13 @@ function renderResult(plan, container, index) {
           ${leg.toDest ? '至目的地' : (leg.from !== undefined ? `至 ${stopName(leg.to)}` : `至 ${stopName(leg.to)}`)}</span>`;
     } else {
       const badge = `<span class="route-badge">${routeShort(leg.routeIdx)}</span>`;
+      const next = nextDepartures(leg.routeIdx, leg.boardStop, leg.headsign, prevEnd - 30, 3);
       row.innerHTML = `
         <span class="when">${hhmm(leg.start)} – ${hhmm(leg.end)}</span>
         <span class="what">${badge}${headsignText(leg.headsign)}
           <span class="stops"><br>${stopName(leg.boardStop)} 上車 · ${stopName(leg.alightStop)} 落車 ·
-          ${leg.stopCount} 個站 · ${mins(leg.seconds)} 分鐘</span></span>`;
+          ${leg.stopCount} 個站 · ${mins(leg.seconds)} 分鐘</span>
+          ${renderNextBuses(next, prevEnd, leg.trip)}</span>`;
     }
     legs.appendChild(row);
     prevEnd = leg.end;
@@ -849,9 +957,12 @@ function nowSeconds() {
 
 function planSignature(p) {
   if (!p) return 'null';
-  return p.arrive + '|' + p.legs.map(l => l.type === 'bus'
-    ? `b${l.trip}:${l.board}:${l.alight}`
-    : `w${Math.round(l.metres)}`).join(',');
+  return p.arrive + '|' + p.legs.map(l => {
+    if (l.type !== 'bus') return `w${Math.round(l.metres)}`;
+    // include the upcoming departures so the "next bus" chips refresh when they change
+    const next = nextDepartures(l.routeIdx, l.boardStop, l.headsign, l.start - 30, 3).map(d => d.dep).join('.');
+    return `b${l.trip}:${l.board}:${l.alight}:${next}`;
+  }).join(',');
 }
 
 /**
