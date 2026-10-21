@@ -352,6 +352,37 @@ function walkGeometry(a, c) {
   return out.length > 1 ? out : null;
 }
 
+/** Length of a polyline, summing haversine metres between consecutive points. */
+function lineMetres(points) {
+  let m = 0;
+  for (let i = 1; i < points.length; i++) {
+    m += haversine(points[i - 1][0], points[i - 1][1], points[i][0], points[i][1]);
+  }
+  return m;
+}
+
+/**
+ * Walking distance of one transfer link, measured on the footpath that will be
+ * drawn. Same number on the map and in the itinerary text is the whole point.
+ */
+function walkLinkMetres(s, k) {
+  if (!state.walkLen) state.walkLen = new Float32Array(state.walk.pairs.length).fill(-1);
+  let m = state.walkLen[k];
+  if (m >= 0) return m;
+  const geo = walkGeometry(s, state.walk.pairs[k]);
+  m = geo ? lineMetres(geo) : state.walk.metres[k];
+  state.walkLen[k] = m;
+  return m;
+}
+
+/** Walking distance from an arbitrary point to a stop, along the drawn footpath. */
+function pointWalkMetres(point, stopIdx) {
+  const geo = endWalkPath(point, stopIdx);
+  if (geo) return lineMetres(geo);
+  const s = state.stops[stopIdx];
+  return haversine(point.lat, point.lon, s[1], s[2]);
+}
+
 function legGeometry(pi, board, alight) {
   const s = state.shapes;
   if (!s || pi === undefined || pi === null || pi < 0 || pi >= s.nPat) return null;
@@ -523,10 +554,12 @@ function plan(origin, dest, departSec, options = {}) {
     : stopsNear(origin.lat, origin.lon, ORIGIN_WALK_M);
 
   for (const s of origins) {
-    const t = departSec + s.seconds;
+    // the walk to a picked place is measured on the footpath that gets drawn
+    const metres = origin.stop !== undefined ? 0 : pointWalkMetres(origin, s.stop);
+    const t = departSec + Math.round(metres / WALK_SPEED);
     if (t < tau[s.stop]) {
       tau[s.stop] = t;
-      parent[s.stop] = { type: 'walk0', metres: s.metres };
+      parent[s.stop] = { type: 'walk0', metres };
       seeded[s.stop] = 1;
       pq.push(s.stop, t);
     }
@@ -542,10 +575,11 @@ function plan(origin, dest, departSec, options = {}) {
     // walking transfers out of this stop
     for (let k = state.walk.off[s]; k < state.walk.off[s + 1]; k++) {
       const n = state.walk.pairs[k];
-      const cand = t + Math.max(30, Math.round(state.walk.metres[k] / WALK_SPEED));
+      const metres = walkLinkMetres(s, k);              // footpath length, not the chord
+      const cand = t + Math.max(30, Math.round(metres / WALK_SPEED));
       if (cand < tau[n] - 1e-6) {
         tau[n] = cand;
-        parent[n] = { type: 'walk', from: s, metres: state.walk.metres[k] };
+        parent[n] = { type: 'walk', from: s, metres };
         pq.push(n, cand);
       }
     }
@@ -587,8 +621,9 @@ function plan(origin, dest, departSec, options = {}) {
   } else {
     for (const s of stopsNear(dest.lat, dest.lon, ORIGIN_WALK_M)) {
       if (tau[s.stop] >= INF) continue;
-      const t = tau[s.stop] + s.seconds;
-      if (!best || t < best.time) best = { stop: s.stop, time: t, walk: s.metres };
+      const metres = pointWalkMetres(dest, s.stop);     // the footpath to the door
+      const t = tau[s.stop] + Math.round(metres / WALK_SPEED);
+      if (!best || t < best.time) best = { stop: s.stop, time: t, walk: metres };
     }
   }
   if (!best) return null;
@@ -628,7 +663,11 @@ function plan(origin, dest, departSec, options = {}) {
     if (leg.type === 'walk' && prev && prev.type === 'walk') {
       prev.metres += leg.metres;
       prev.to = leg.to;
-      if (leg.toDest) prev.toDest = true;
+      if (leg.toDest) {
+        prev.toDest = true;
+        prev.via = leg.from;            // the kerb the merged walk turns at
+        prev.to = undefined;
+      }
       continue;
     }
     merged.push({ ...leg });
@@ -774,6 +813,17 @@ function walkLine(leg) {
   if (fromStop !== null && toStop !== null) {
     const geo = walkGeometry(fromStop, toStop);
     if (geo) return geo;
+    // merged walks span two links (through a kerb that is not a leg of its own):
+    // stitch the two footpaths instead of falling back to a straight line
+    let best = null;
+    for (let k = state.walk.off[fromStop]; k < state.walk.off[fromStop + 1]; k++) {
+      const mid = state.walk.pairs[k];
+      const a = walkGeometry(fromStop, mid), b = walkGeometry(mid, toStop);
+      if (!a || !b) continue;
+      const len = lineMetres(a) + lineMetres(b);
+      if (!best || len < best.len) best = { len, line: a.concat(b.slice(1)) };
+    }
+    if (best) return best.line;
     return [[st[fromStop][1], st[fromStop][2]], [st[toStop][1], st[toStop][2]]];
   }
 
@@ -781,7 +831,14 @@ function walkLine(leg) {
   const stopIdx = fromStop !== null ? fromStop : toStop;
   if (stopIdx === null || stopIdx === undefined) return null;
   const target = [st[stopIdx][1], st[stopIdx][2]];
-  const toStopWalk = endWalkPath(point, stopIdx);
+  let toStopWalk = null;
+  if (leg.via !== undefined && leg.via !== null && leg.via !== stopIdx) {
+    // merged walk: follow the first footpath to the turn, then the spur to the door
+    const a = walkGeometry(stopIdx, leg.via);
+    const b = endWalkPath(point, leg.via);
+    if (a && b) toStopWalk = a.concat(b.slice(1));
+  }
+  if (!toStopWalk) toStopWalk = endWalkPath(point, stopIdx);
   const line = toStopWalk || [[point.lat, point.lon], target];
   // keep the drawn line in the same ballpark as the quoted metres
   let length = 0;
