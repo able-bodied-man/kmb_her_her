@@ -227,7 +227,6 @@ button.ghost:hover { border-color: var(--red); color: var(--red); }
 .eta.r1 { background: #e5f6ea; color: #14713a; border-color: #b9e2c6; }
 .eta.r2 { background: #fff3df; color: #8f5c00; border-color: #efd6a8; }
 .eta.r3 { background: #eeeef1; color: #5f5f66; border-color: #dadade; }
-.eta.taken { box-shadow: inset 0 0 0 1.5px currentColor; }
 
 .empty {
   background: var(--card);

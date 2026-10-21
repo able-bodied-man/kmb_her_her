@@ -922,24 +922,16 @@ function nextDepartures(routeIdx, boardStop, headsignIdx, afterSec, count = 3, h
 }
 
 /**
- * Ovals sitting right next to the direction: the 1st bus of this route that
- * reaches this kerb is green, the 2nd amber, the 3rd grey, each carrying its
- * countdown. The bus the plan actually catches is ringed.
+ * Ovals sitting right next to the direction: the next buses of this route at this
+ * kerb, counted in minutes **from the journey's departure time** so every oval in
+ * the itinerary shares one reference point. 1st green, 2nd amber, 3rd grey.
  */
-function renderNextBuses(list, readyAt, legStart) {
+function renderNextBuses(list, planDepart) {
   if (!list || !list.length) return '';
-  const items = list.slice(0, 3).map((d) => d.dep);
-  // The plan can board a bus that sits beyond the merged-variant list; show it
-  // anyway so the ringed oval always exists and always means "the one you take".
-  if (legStart !== undefined && !items.some((dep) => Math.abs(dep - legStart) <= 60)) {
-    if (items.length >= 3) items[2] = legStart; else items.push(legStart);
-    items.sort((a, b) => a - b);
-  }
-  return items.map((dep, i) => {
-    const wait = Math.max(0, Math.round((dep - readyAt) / 60));
-    const taken = legStart !== undefined && Math.abs(dep - legStart) <= 60 ? ' taken' : '';
+  return list.slice(0, 3).map((d, i) => {
+    const wait = Math.max(0, Math.round((d.dep - planDepart) / 60));
     const label = ['下一班', '第二班', '第三班'][i];
-    return `<i class="eta r${i + 1}${taken}" title="${label} · ${wait} 分鐘後（${hhmm(dep)}）">${wait} 分</i>`;
+    return `<i class="eta r${i + 1}" title="${label} · ${hhmm(d.dep)} 開出（出發後 ${wait} 分鐘）">${wait} 分</i>`;
   }).join('');
 }
 
@@ -972,7 +964,7 @@ function legsHTML(plan) {
       const next = nextDepartures(leg.routeIdx, leg.boardStop, leg.headsign, prevEnd - 30, 3);
       html += `<div class="leg bus">
         <span class="when">${hhmm(leg.start)} – ${hhmm(leg.end)}</span>
-        <span class="what">${badge}${headsignText(leg.headsign)}${renderNextBuses(next, prevEnd, leg.start)}
+        <span class="what">${badge}${headsignText(leg.headsign)}${renderNextBuses(next, plan.depart)}
           <span class="stops"><br>${stopName(leg.boardStop)} 上車 · ${stopName(leg.alightStop)} 落車 ·
           ${leg.stopCount} 個站 · ${mins(leg.seconds)} 分鐘</span></span></div>`;
     }
