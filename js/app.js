@@ -40,13 +40,17 @@ const u16 = (b, o, n) => new Uint16Array(b.slice(o, o + n * 2));
 const u32 = (b, o, n) => new Uint32Array(b.slice(o, o + n * 4));
 
 async function boot() {
-  const [stops, routes, headsigns, cal] = await Promise.all([
+  const [stops, routes, headsigns, cal, meta] = await Promise.all([
     getJSON('stops.json'), getJSON('routes.json'), getJSON('headsigns.json'), getJSON('calendar.json'),
+    getJSON('meta.json'),
   ]);
   state.stops = stops;
   state.routes = routes;
   state.headsigns = headsigns;
   state.cal = cal;
+  state.meta = meta;
+  state.generated = meta.generated || null;
+  state.digest = meta.digest || null;
   cal.services.forEach((sid, i) => { state.calIndex[sid] = i; });
 
   const [tripsBuf, stBuf, walkBuf, patBuf, spBuf] = await Promise.all([
@@ -104,9 +108,47 @@ async function boot() {
   state.sp = { off: u32(spBuf, 12, spStops + 1), pair: u32(spBuf, 12 + (spStops + 1) * 4, spInc) };
 
   buildSearchIndex();
-  initMap();
+  if (!state.map) initMap();
   setStatus(`已載入 ${state.stops.length} 個站、${state.pat.n} 條路線組合；請輸入起點及終點。`);
-  document.getElementById('go').disabled = false;
+  document.getElementById('go').disabled = !(state.from && state.to);
+}
+
+/* ------------------------------------------------------- keeping data current
+ * The dataset is rebuilt in CI every 30 minutes. An open page polls meta.json
+ * and, when a newer build appears, reloads the data and re-runs the current
+ * query in place — no page refresh, no lost selection.
+ */
+const DATA_POLL_MS = 3 * 60 * 1000;
+let refreshing = false;
+
+function rememberQuery() {
+  state.lastQuery = { from: state.from, to: state.to, depart: timeFromInput() };
+}
+
+async function checkForUpdate(manual = false) {
+  if (refreshing || !state.stops.length) return;
+  try {
+    const r = await fetch(DATA + 'meta.json', { cache: 'no-store' });
+    if (!r.ok) return;
+    const meta = await r.json();
+    const same = meta.digest ? meta.digest === state.digest : meta.generated === state.generated;
+    if (!meta.generated || same) {
+      if (manual) setStatus(`資料已是最新（${state.generated || '未知'} UTC 版本）。`);
+      return;
+    }
+    refreshing = true;
+    const hadQuery = state.lastQuery;
+    await boot();
+    if (hadQuery && state.from && state.to) {
+      document.getElementById('time-input').value = hhmm(hadQuery.depart);
+      run();
+    }
+    setStatus(`資料已更新至 ${meta.generated} UTC 版本（班次 ${meta.counts.trips} 班）。`);
+  } catch (e) {
+    console.warn('update check failed', e);
+  } finally {
+    refreshing = false;
+  }
 }
 
 /* -------------------------------------------------------------- search index */
@@ -811,6 +853,7 @@ function run() {
   const container = document.getElementById('results');
   container.innerHTML = '';
   const depart = timeFromInput();
+  rememberQuery();
 
   // a coordinate origin/destination only works if a stop is walkable from it
   for (const [sel, name] of [[state.from, '起點'], [state.to, '終點']]) {
@@ -855,9 +898,13 @@ window.addEventListener('DOMContentLoaded', () => {
   document.getElementById('time-input').value = hhmmNow();
   document.getElementById('go').addEventListener('click', run);
   document.getElementById('go').disabled = true;
+  const refreshBtn = document.getElementById('data-refresh');
+  if (refreshBtn) refreshBtn.addEventListener('click', () => checkForUpdate(true));
+  setInterval(() => checkForUpdate(false), DATA_POLL_MS);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) checkForUpdate(false); });
   // handle for debugging / tests (no effect on the UI)
   window.__khh = { state, plan, searchStops, searchPlaces, hhmm, stopName, routeShort,
-                   headsignText, run, stopsNear };
+                   headsignText, run, stopsNear, checkForUpdate, boot };
   boot().catch(err => {
     console.error(err);
     setStatus(`載入失敗：${err.message}`);

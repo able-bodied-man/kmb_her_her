@@ -5,8 +5,11 @@ on:
     branches: ["main"]
   workflow_dispatch:
   schedule:
-    # the TD feed is refreshed biweekly; rebuild the routing data weekly
-    - cron: "17 20 * * 0"
+    # Rebuild and redeploy every 30 minutes so an open page always has a recent
+    # dataset (the client polls meta.json and swaps data in place).
+    # The TD timetable itself is biweekly; what actually changes within a day is
+    # the operator API side (names/headsigns) and any feed correction.
+    - cron: "*/30 * * * *"
 
 permissions:
   contents: read

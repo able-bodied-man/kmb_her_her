@@ -105,6 +105,20 @@ Why client-side: GitHub Pages cannot run a server, and the whole dataset fits in
 per-segment calibration arrive, the same pipeline can precompute them in CI
 instead of adding a backend.
 
+## Keeping the data current
+
+The dataset is rebuilt and redeployed **every 30 minutes** by the Pages workflow
+(`cron: */30 * * * *`), on every push, and on demand via the 更新 button in the UI.
+
+An open page does not need a refresh: it polls `data/meta.json` every 3 minutes
+(and whenever the tab becomes visible again), compares the payload `digest` with
+the one it loaded, and on a genuine change re-fetches the dataset and re-runs the
+current query in place — same origin, same destination, same departure time.
+
+The `digest` is a SHA-256 over the payload files, so a 30-minute rebuild that
+produces identical output does **not** disturb an open page; only a real change
+does. `generated` remains the wall-clock timestamp of the build for display.
+
 ## Phases
 
 - [x] **0. Hosting** — Pages + Actions deploy, live at

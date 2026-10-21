@@ -72,6 +72,24 @@ def log(msg: str) -> None:
     print(msg, flush=True)
 
 
+def data_digest(out_dir: str) -> str:
+    """Hash of the payload files, so the client can tell a real data change from
+    a rebuild that produced identical output (the CI redeploys every 30 min)."""
+    import hashlib
+    h = hashlib.sha256()
+    for name in sorted(os.listdir(out_dir)):
+        if name == "meta.json":
+            continue
+        p = os.path.join(out_dir, name)
+        if not os.path.isfile(p):
+            continue
+        h.update(name.encode())
+        with open(p, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+    return h.hexdigest()[:16]
+
+
 def fetch(name: str) -> str:
     os.makedirs(CACHE, exist_ok=True)
     path = os.path.join(CACHE, name)
@@ -547,6 +565,7 @@ def main() -> int:
 
     meta = {
         "generated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "digest": data_digest(OUT),
         "feed": FEED_BASE,
         "agencies": [{"id": a, "name": agencies.get(a, a)} for a in sorted(ALLOWED_AGENCIES)],
         "counts": {"routes": len(route_order), "trips": len(t_route), "stop_times": n_stopts,
