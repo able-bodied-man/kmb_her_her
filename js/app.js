@@ -17,7 +17,7 @@ const INF = 1e9;
 const MAX_OFFSET_SLACK = 7200;   // guard for binary search over trip starts
 
 const state = {
-  stops: [], routes: [], headsigns: [], cal: null, calIndex: {},
+  stops: [], routes: [], headsigns: [], cal: null, calIndex: {}, cards: [],
   trips: null, st: null, walk: null, pat: null, sp: null,
   from: null, to: null,
   map: null, mapLayers: [],
@@ -939,59 +939,80 @@ function renderNextBuses(list, readyAt, legStart) {
   }).join('');
 }
 
-function renderResult(plan, container, index) {
-  const card = document.createElement('article');
-  card.className = 'card' + (index === 0 ? ' active' : '');
-
+function summaryHTML(plan) {
   const transfers = plan.legs.filter(l => l.type === 'bus').length - 1;
   const walkMetres = plan.legs.filter(l => l.type === 'walk').reduce((a, l) => a + l.metres, 0);
-  const head = document.createElement('div');
-  head.className = 'summary';
-  head.innerHTML = `
+  return `
     <span class="total">${mins(plan.arrive - plan.depart)} 分鐘</span>
     <span class="times">${hhmm(plan.depart)} 出發 → ${hhmm(plan.arrive)} 抵達</span>
     <span class="times">${transfers > 0 ? `轉乘 ${transfers} 次` : '直達'}${walkMetres >= 50 ? ` · 步行 ${walkMetres >= 1000 ? (walkMetres / 1000).toFixed(1) + ' 公里' : Math.round(walkMetres) + ' 米'}` : ''}</span>`;
-  card.appendChild(head);
+}
 
-  const legs = document.createElement('div');
-  legs.className = 'legs';
+function legsHTML(plan) {
+  let html = '';
   let prevEnd = plan.depart;
   for (const leg of plan.legs) {
     if (leg.type === 'walk' && leg.metres < 40) { prevEnd = leg.end; continue; }   // same-kerb shuffle
     const wait = leg.start - prevEnd;
     if (wait >= 180) {
-      const w = document.createElement('div');
-      w.className = 'leg wait';
-      w.innerHTML = `<span class="when">${hhmm(prevEnd)}</span><span class="what">等候 ${mins(wait)} 分鐘</span>`;
-      legs.appendChild(w);
+      html += `<div class="leg wait"><span class="when">${hhmm(prevEnd)}</span>
+        <span class="what">等候 ${mins(wait)} 分鐘</span></div>`;
     }
-    const row = document.createElement('div');
-    row.className = 'leg ' + leg.type;
     if (leg.type === 'walk') {
-      row.innerHTML = `
+      html += `<div class="leg walk">
         <span class="when">${hhmm(leg.start)} – ${hhmm(leg.end)}</span>
         <span class="what">步行 ${mins(leg.seconds)} 分鐘（約 ${Math.round(leg.metres)} 米）
-          ${leg.toDest ? '至目的地' : (leg.from !== undefined ? `至 ${stopName(leg.to)}` : `至 ${stopName(leg.to)}`)}</span>`;
+          ${leg.toDest ? '至目的地' : `至 ${stopName(leg.to)}`}</span></div>`;
     } else {
       const badge = `<span class="route-badge">${routeShort(leg.routeIdx)}</span>`;
       const next = nextDepartures(leg.routeIdx, leg.boardStop, leg.headsign, prevEnd - 30, 3);
-      row.innerHTML = `
+      html += `<div class="leg bus">
         <span class="when">${hhmm(leg.start)} – ${hhmm(leg.end)}</span>
         <span class="what">${badge}${headsignText(leg.headsign)}${renderNextBuses(next, prevEnd, leg.start)}
           <span class="stops"><br>${stopName(leg.boardStop)} 上車 · ${stopName(leg.alightStop)} 落車 ·
-          ${leg.stopCount} 個站 · ${mins(leg.seconds)} 分鐘</span></span>`;
+          ${leg.stopCount} 個站 · ${mins(leg.seconds)} 分鐘</span></span></div>`;
     }
-    legs.appendChild(row);
     prevEnd = leg.end;
   }
+  return html;
+}
+
+function renderResult(plan, container, index) {
+  const card = document.createElement('article');
+  card.className = 'card' + (index === 0 ? ' active' : '');
+
+  const head = document.createElement('div');
+  head.className = 'summary';
+  head.innerHTML = summaryHTML(plan);
+  card.appendChild(head);
+
+  const legs = document.createElement('div');
+  legs.className = 'legs';
+  legs.innerHTML = legsHTML(plan);
   card.appendChild(legs);
+
   card.addEventListener('click', () => {
     document.querySelectorAll('.card').forEach(c => c.classList.remove('active'));
     card.classList.add('active');
-    drawPlan(plan);
+    drawPlan(card.__plan || plan);
   });
+  card.__plan = plan;
   container.appendChild(card);
   return card;
+}
+
+/**
+ * Redraw one card in place from a fresh plan. Used by the 30-second ticker when
+ * the itinerary itself is unchanged but the countdowns have moved — replacing the
+ * legs block keeps the map, the pan/zoom and the reader's scroll position intact.
+ */
+function refreshCard(card, plan) {
+  if (!card || !plan) return;
+  card.__plan = plan;
+  const head = card.querySelector('.summary');
+  if (head) head.innerHTML = summaryHTML(plan);
+  const legs = card.querySelector('.legs');
+  if (legs) legs.innerHTML = legsHTML(plan);
 }
 
 /** Departure time is simply "when the user pressed 規劃路線", in Hong Kong time. */
@@ -1000,14 +1021,16 @@ function nowSeconds() {
   return d.getUTCHours() * 3600 + d.getUTCMinutes() * 60 + d.getUTCSeconds();
 }
 
-function planSignature(p) {
+/**
+ * Identity of an itinerary: the legs you would actually ride. It deliberately
+ * ignores clock times and countdowns, so the ticker can tell "same journey, the
+ * seconds moved" apart from "a different journey".
+ */
+function structureSig(p) {
   if (!p) return 'null';
-  return p.arrive + '|' + p.legs.map(l => {
-    if (l.type !== 'bus') return `w${Math.round(l.metres)}`;
-    // include the upcoming departures so the "next bus" chips refresh when they change
-    const next = nextDepartures(l.routeIdx, l.boardStop, l.headsign, l.start - 30, 3).map(d => d.dep).join('.');
-    return `b${l.trip}:${l.board}:${l.alight}:${next}`;
-  }).join(',');
+  return p.legs.map(l => l.type === 'walk'
+    ? `w${Math.round(l.metres)}`
+    : `b${l.trip}:${l.board}:${l.alight}`).join(',');
 }
 
 /**
@@ -1045,15 +1068,18 @@ function run(auto = false) {
   const alt = bus ? plan(state.from, state.to, depart, { bannedPat: new Set([bus.pattern]) }) : null;
   const altOk = alt && alt.arrive > first.arrive ? alt : null;
 
-  const sig = planSignature(first) + '#' + planSignature(altOk);
+  const sig = structureSig(first) + '#' + structureSig(altOk);
   if (auto && sig === state.lastSignature) {
-    state.lastDepart = depart;              // nothing changed, stay quiet
+    // Same journey, but the clock moved: refresh times and countdowns in place.
+    refreshCard(state.cards[0], first);
+    if (altOk && state.cards[1]) refreshCard(state.cards[1], altOk);
+    state.lastDepart = depart;
     return;
   }
 
   container.innerHTML = '';
-  const card = renderResult(first, container, 0);
-  if (altOk) renderResult(altOk, container, 1);
+  state.cards = [renderResult(first, container, 0)];
+  if (altOk) state.cards.push(renderResult(altOk, container, 1));
   drawPlan(first);
   state.lastSignature = sig;
   state.lastDepart = depart;
