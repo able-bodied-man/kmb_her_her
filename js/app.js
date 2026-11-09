@@ -866,6 +866,81 @@ function walkLine(leg) {
   return leg.from === undefined ? draw : draw.slice().reverse();   // stop → place walks backwards
 }
 
+/** Operator kerb ids for a stop (several at interchanges), used for live ETAs. */
+function kmbStopOf(i) {
+  const s = state.stops[i];
+  if (!s || !s[5]) return [];
+  return Array.isArray(s[5]) ? s[5] : [s[5]];
+}
+
+/* --------------------------------------------------------------- live ETA */
+const LIVE_ETA_URL = 'https://data.etabus.gov.hk/v1/transport/kmb/eta/';
+const LIVE_TTL_MS = 25 * 1000;
+const liveCache = new Map();            // `${stop}/${route}` -> {t, rows}
+
+/** "2026-11-07T22:07:05+08:00" -> seconds since midnight (Hong Kong). */
+function isoSeconds(iso) {
+  const m = /T(\d\d):(\d\d)(?::(\d\d))?/.exec(iso || '');
+  return m ? (+m[1]) * 3600 + (+m[2]) * 60 + (+(m[3] || 0)) : null;
+}
+
+async function liveEta(stopId, route) {
+  const key = stopId + '/' + route;
+  const hit = liveCache.get(key);
+  if (hit && Date.now() - hit.t < LIVE_TTL_MS) return hit.rows;
+  try {
+    const r = await fetch(`${LIVE_ETA_URL}${stopId}/${route}/1`, { cache: 'no-store' });
+    if (!r.ok) throw new Error(String(r.status));
+    const rows = ((await r.json()).data || [])
+      .filter((x) => x.eta)
+      .map((x) => ({ sec: isoSeconds(x.eta), remark: x.rmk_tc || '' }))
+      .filter((x) => x.sec !== null)
+      .sort((a, b) => a.sec - b.sec)
+      .slice(0, 3);
+    liveCache.set(key, { t: Date.now(), rows });
+    return rows;
+  } catch (e) {
+    liveCache.set(key, { t: Date.now(), rows: [] });      // don't hammer a failing endpoint
+    return [];
+  }
+}
+
+/**
+ * Replace a leg's countdown with the operator's live ETAs. The rider compares
+ * this number with the KMB app, so when the API answers, its time wins over the
+ * reconstructed timetable.
+ */
+function paintLive(box, rows, refAt) {
+  if (!rows.length) return false;
+  box.classList.add('live');
+  box.innerHTML = rows.map((r, i) => {
+    const wait = Math.max(0, Math.round((r.sec - refAt) / 60));
+    const label = ['下一班', '第二班', '第三班'][i];
+    const kind = r.remark || '即時';
+    return `<i class="eta r${i + 1}" title="${label} · ${kind} ${hhmm(r.sec)}">${wait} 分</i>`;
+  }).join('');
+  return true;
+}
+
+/** Fill every boarding kerb on this card with live ETAs (async, best effort). */
+function enrichLive(card) {
+  if (!card || !card.__plan) return;
+  const plan = card.__plan;
+  for (const box of card.querySelectorAll('.etas[data-stop]')) {
+    const route = box.dataset.route;
+    const stopIds = (box.dataset.stop || '').split(',').filter(Boolean);
+    if (!stopIds.length || !route) continue;
+    (async () => {
+      for (const id of stopIds) {                 // interchanges have several kerbs
+        const rows = await liveEta(id, route);
+        if (!rows.length) continue;
+        if (card.isConnected && box.isConnected) paintLive(box, rows, plan.depart);
+        return;
+      }
+    })();
+  }
+}
+
 /**
  * Footpath from an arbitrary point to a stop: snap the point to the nearest
  * vertex of the footpaths that feed that stop, then follow that path in.
@@ -1142,7 +1217,7 @@ function legsHTML(plan) {
       const next = nextDepartures(leg.routeIdx, leg.boardStop, leg.headsign, prevEnd - 30, 3);
       html += `<div class="leg bus">
         <span class="when">${hhmm(leg.start)} – ${hhmm(leg.end)}</span>
-        <span class="what">${badge}${headsignText(leg.headsign)}${renderNextBuses(next, plan.depart)}
+        <span class="what">${badge}${headsignText(leg.headsign)}<span class="etas" data-stop="${kmbStopOf(leg.boardStop).join(',')}" data-route="${routeShort(leg.routeIdx)}">${renderNextBuses(next, plan.depart)}</span>
           <details class="stoplist" data-k="${k}"><summary>${stopName(leg.boardStop)} 上車 ·
           ${stopName(leg.alightStop)} 落車 · ${leg.stopCount} 個站 · ${mins(leg.seconds)} 分鐘</summary>
           ${stopListHTML(leg)}</details></span></div>`;
@@ -1191,6 +1266,7 @@ function renderResult(plan, container, index) {
     document.querySelectorAll('.card').forEach(c => c.classList.remove('active'));
     card.classList.add('active');
     drawPlan(card.__plan);
+    enrichLive(card);                     // live ETAs for the legs now on screen
   });
   card.addEventListener('click', (e) => {
     if (e.target.closest('.stoplist')) return;          // toggling a stop list is not a card click
@@ -1221,6 +1297,8 @@ function refreshCard(card, plan) {
       const d = legs.querySelector(`details.stoplist[data-k="${k}"]`);
       if (d) d.open = true;
     }
+    const det = card.querySelector('details.itin');
+    if (det && det.open) enrichLive(card);          // repaint live ETAs after a redraw
   }
 }
 

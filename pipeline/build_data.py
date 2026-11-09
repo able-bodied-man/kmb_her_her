@@ -21,7 +21,7 @@ and total run time are exact.
 
 Output (written to <repo>/data/):
   meta.json        counts, feed timestamp, bounds, caveats
-  stops.json       [[stop_id, lat, lon, name], ...]
+  stops.json       [[stop_id, lat, lon, name, name_tc, [kmb_stop_id, ...]], ...]
   routes.json      [[route_id, short_name, long_name, agency_id], ...]
   calendar.json    {services:[...], calendar:{...}, exceptions:[...]}
   trips.bin        columnar: u16 route, u8 service, u32 start_sec,
@@ -332,6 +332,9 @@ def main() -> int:
     for row in stop_list:
         hit = matched.get(str(row[0]))
         row.append(hit["name_tc"] if hit else None)
+        # every operator kerb within the match radius: the live ETA must be asked
+        # of the kerb this route actually serves, which is not always the nearest
+        row.append(hit["near"] if hit else None)
     log(f"      {len(matched)} / {len(stop_list)} stops matched to the operator feed "
         f"({100 * len(matched) / len(stop_list):.1f}%)")
 
@@ -339,7 +342,12 @@ def main() -> int:
     variants: dict[str, list[dict]] = {}
     api_routes = {(r["route"], r["bound"], r["service_type"]): r for r in kmb_api.routes()}
     seqs_rows: dict[tuple[str, str, str], list[tuple[int, str]]] = {}
-    for rs in kmb_api.get("/route-stop", cache_name="all_route_stops", ttl=24 * 3600)["data"]:
+    try:
+        route_stop_rows = kmb_api.get("/route-stop", cache_name="all_route_stops", ttl=24 * 3600)["data"]
+    except Exception as exc:                      # operator API outages must not break the build
+        log(f"      WARNING: /route-stop unavailable ({exc}); skipping headsign alignment")
+        route_stop_rows = []
+    for rs in route_stop_rows:
         seqs_rows.setdefault((rs["route"], rs["bound"], rs["service_type"]), []).append(
             (int(rs["seq"]), rs["stop"]))
     seqs: dict[tuple[str, str, str], list[str]] = {

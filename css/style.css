@@ -292,6 +292,17 @@ button.ghost:hover { border-color: var(--red); color: var(--red); }
   font-size: 10.5px;
 }
 
+/* live ETAs: the countdown the rider compares with the KMB app */
+.etas { display: inline-flex; align-items: center; }
+.etas.live::before {
+  content: "即時";
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: .3px;
+  color: #14713a;
+  margin-left: 6px;
+}
+
 /* next arrivals, as ovals next to the direction: 1st green, 2nd amber, 3rd grey */
 .eta {
   display: inline-flex;

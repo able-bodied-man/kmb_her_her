@@ -43,7 +43,12 @@ def get(path: str, *, cache_name: str | None = None, ttl: float | None = None,
     last = None
     for attempt in range(retries):
         try:
-            with urllib.request.urlopen(url, timeout=45) as r:
+            # the open-data endpoints answer 403 to urllib's default user agent
+            req = urllib.request.Request(url, headers={
+                "User-Agent": "kmb-her-her/1.0 (+https://github.com/able-bodied-man/kmb_her_her)",
+                "Accept": "application/json",
+            })
+            with urllib.request.urlopen(req, timeout=45) as r:
                 data = json.loads(r.read().decode())
             if cache_name:
                 tmp = _cache_path(cache_name) + ".part"
